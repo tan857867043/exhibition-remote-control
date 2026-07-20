@@ -31,6 +31,7 @@ func InitRouter() {
 
 	// 2. 面向第三方系统的开放 API 接口
 	http.HandleFunc("/api/v1/devices", corsMiddleware(handleListDevices))
+	http.HandleFunc("/api/v1/devices/thumbnail", corsMiddleware(handleThumbnail))
 	http.HandleFunc("/api/v1/stream", handleStreamSubscribe)
 	http.HandleFunc("/api/v1/control", corsMiddleware(handleExternalControl))
 }
@@ -43,6 +44,8 @@ func handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	deviceID := r.URL.Query().Get("device_id")
+	deviceName := r.URL.Query().Get("device_name")
+	deviceOS := r.URL.Query().Get("os")
 	if deviceID == "" {
 		conn.Close()
 		return
@@ -50,11 +53,17 @@ func handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 
 	GlobalHub.mu.Lock()
 	GlobalHub.Agents[deviceID] = conn
+	GlobalHub.DeviceInfos[deviceID] = DeviceInfo{
+		ID:   deviceID,
+		Name: deviceName,
+		OS:   deviceOS,
+	}
 	GlobalHub.mu.Unlock()
 
 	defer func() {
 		GlobalHub.mu.Lock()
 		delete(GlobalHub.Agents, deviceID)
+		delete(GlobalHub.DeviceInfos, deviceID)
 		GlobalHub.mu.Unlock()
 		conn.Close()
 	}()
@@ -67,6 +76,14 @@ func handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if messageType == websocket.BinaryMessage {
+			if len(payload) > 9 && payload[0] == 0x02 { // 0x02 indicates full frame
+				GlobalHub.mu.Lock()
+				// Extract JPEG bytes (skip 9 bytes header)
+				jpegBytes := make([]byte, len(payload)-9)
+				copy(jpegBytes, payload[9:])
+				GlobalHub.LatestFrame[deviceID] = jpegBytes
+				GlobalHub.mu.Unlock()
+			}
 			GlobalHub.mu.RLock()
 			subs := GlobalHub.Subscribers[deviceID]
 			for subConn := range subs {
@@ -121,14 +138,40 @@ func handleExternalControl(w http.ResponseWriter, r *http.Request) {
 
 func handleListDevices(w http.ResponseWriter, r *http.Request) {
 	GlobalHub.mu.RLock()
-	list := make([]string, 0, len(GlobalHub.Agents))
-	for k := range GlobalHub.Agents {
-		list = append(list, k)
+	list := make([]DeviceInfo, 0, len(GlobalHub.DeviceInfos))
+	for _, info := range GlobalHub.DeviceInfos {
+		if info.Name == "" {
+			info.Name = info.ID
+		}
+		list = append(list, info)
 	}
 	GlobalHub.mu.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(list)
+}
+
+func handleThumbnail(w http.ResponseWriter, r *http.Request) {
+	deviceID := r.URL.Query().Get("device_id")
+	if deviceID == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	GlobalHub.mu.RLock()
+	frame, exists := GlobalHub.LatestFrame[deviceID]
+	GlobalHub.mu.RUnlock()
+
+	if !exists || len(frame) == 0 {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte("Thumbnail not available yet"))
+		return
+	}
+
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Write(frame)
 }
 
 func handleStreamSubscribe(w http.ResponseWriter, r *http.Request) {

@@ -1,18 +1,27 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import ExhibitionRemoteClient from "./lib/ExhibitionRemoteClient.js";
-import { Monitor, WifiOff, Settings, Mouse, Cast, Lock, Terminal, Router, X } from "lucide-react";
+import { Monitor, WifiOff, Settings, Mouse, Cast, Lock, Terminal, Router, X, Maximize, Minimize, ChevronLeft, Zap, Image as ImageIcon, Activity } from "lucide-react";
+
+interface DeviceInfo {
+  id: string;
+  name: string;
+  os: string;
+}
 
 export default function App() {
   const [serverUrl, setServerUrl] = useState("http://127.0.0.1:8080");
-  const [devices, setDevices] = useState<string[]>([]);
+  const [devices, setDevices] = useState<DeviceInfo[]>([]);
   const [currentDeviceId, setCurrentDeviceId] = useState<string | null>(null);
   const [status, setStatus] = useState<"disconnected" | "loading" | "connected">("disconnected");
+  const [viewMode, setViewMode] = useState<"devices" | "remote">("devices");
   
   const [fps, setFps] = useState(0);
   const [dataRate, setDataRate] = useState(0);
   const [blockCount, setBlockCount] = useState(0);
   const [resolution, setResolution] = useState("--");
   const [keyboardCaptured, setKeyboardCaptured] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [qualityMode, setQualityMode] = useState<"smooth" | "balanced" | "hd">("balanced");
   
   const [deviceNames, setDeviceNames] = useState<Record<string, string>>(() => {
     try {
@@ -27,21 +36,28 @@ export default function App() {
   const [editingName, setEditingName] = useState("");
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
   const clientRef = useRef<any>(null);
   
   const fpsCounterRef = useRef(0);
   const bytesReceivedRef = useRef(0);
   const blockCounterRef = useRef(0);
 
-  const getDeviceName = (id: string) => deviceNames[id] || id;
+  const getDeviceName = (id: string) => {
+    const custom = deviceNames[id];
+    if (custom) return custom;
+    const info = devices.find(d => d.id === id);
+    return info?.name || id;
+  };
 
   const loadDevices = async () => {
+    if (viewMode === 'remote') return;
     setStatus("loading");
     try {
       const res = await fetch(`${serverUrl}/api/v1/devices`);
       const data = await res.json();
       setDevices(data);
-      setStatus(currentDeviceId ? "connected" : "disconnected");
+      setStatus("disconnected");
     } catch (e) {
       console.error(e);
       setStatus("disconnected");
@@ -51,8 +67,12 @@ export default function App() {
 
   useEffect(() => {
     loadDevices();
+    const interval = setInterval(() => {
+      if (viewMode === 'devices') loadDevices();
+    }, 5000);
+    return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [viewMode, serverUrl]);
 
   const connectDevice = (deviceId: string) => {
     if (!deviceId) return;
@@ -63,18 +83,22 @@ export default function App() {
     }
 
     setCurrentDeviceId(deviceId);
+    setViewMode("remote");
     
-    if (canvasRef.current) {
-      clientRef.current = new ExhibitionRemoteClient(canvasRef.current, serverUrl, deviceId, (stats: any) => {
-        if (stats.type === 'frame') {
-          fpsCounterRef.current++;
-          bytesReceivedRef.current += stats.byteLength || 0;
-          if (stats.frameType === 0x01) blockCounterRef.current++;
-        } else if (stats.type === 'keyboard') {
-          setKeyboardCaptured(stats.captured);
-        }
-      });
-    }
+    // We need to wait for the view to render the canvas before initializing the client
+    setTimeout(() => {
+      if (canvasRef.current) {
+        clientRef.current = new ExhibitionRemoteClient(canvasRef.current, serverUrl, deviceId, (stats: any) => {
+          if (stats.type === 'frame') {
+            fpsCounterRef.current++;
+            bytesReceivedRef.current += stats.byteLength || 0;
+            if (stats.frameType === 0x01) blockCounterRef.current++;
+          } else if (stats.type === 'keyboard') {
+            setKeyboardCaptured(stats.captured);
+          }
+        });
+      }
+    }, 100);
 
     fpsCounterRef.current = 0;
     bytesReceivedRef.current = 0;
@@ -95,14 +119,15 @@ export default function App() {
     setBlockCount(0);
     setResolution("--");
     setKeyboardCaptured(false);
-
-    if (canvasRef.current) {
-      const ctx = canvasRef.current.getContext('2d');
-      if (ctx) ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+    setViewMode("devices");
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(err => console.log(err));
     }
   };
 
   useEffect(() => {
+    if (viewMode !== 'remote') return;
+
     const fpsTimer = setInterval(() => {
       setFps(fpsCounterRef.current);
       fpsCounterRef.current = 0;
@@ -130,9 +155,29 @@ export default function App() {
       clearInterval(blockTimer);
       clearInterval(resTimer);
     };
+  }, [viewMode]);
+
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      setIsFullscreen(!!document.fullscreenElement);
+    };
+    document.addEventListener('fullscreenchange', handleFullscreenChange);
+    return () => document.removeEventListener('fullscreenchange', handleFullscreenChange);
   }, []);
 
-  const openDeviceDetails = (id: string) => {
+  const toggleFullscreen = () => {
+    if (!containerRef.current) return;
+    if (!document.fullscreenElement) {
+      containerRef.current.requestFullscreen().catch(err => {
+        console.error(`Error attempting to enable full-screen mode: ${err.message}`);
+      });
+    } else {
+      document.exitFullscreen();
+    }
+  };
+
+  const openDeviceDetails = (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
     setEditingDeviceId(id);
     setEditingName(deviceNames[id] || "");
     setModalOpen(true);
@@ -153,14 +198,14 @@ export default function App() {
   };
 
   return (
-    <div className="flex flex-col h-screen w-full overflow-hidden bg-slate-950 text-slate-200 font-sans">
+    <div className="flex flex-col h-screen w-full overflow-hidden bg-slate-950 text-slate-200 font-sans select-none">
       {/* Modal */}
       {modalOpen && (
         <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center">
           <div className="bg-slate-900 border border-slate-700 rounded-xl shadow-2xl w-full max-w-md overflow-hidden flex flex-col">
             <div className="px-6 py-4 border-b border-slate-800 flex justify-between items-center bg-slate-900/50">
               <h3 className="text-lg font-bold text-slate-100 flex items-center gap-2">
-                <Terminal className="w-5 h-5 text-emerald-500" />
+                <Terminal className="w-5 h-5 text-indigo-500" />
                 设备详情
               </h3>
               <button onClick={() => setModalOpen(false)} className="text-slate-500 hover:text-slate-300">
@@ -170,7 +215,7 @@ export default function App() {
             <div className="p-6 flex flex-col gap-5">
               <div className="flex flex-col gap-1.5">
                 <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">系统设备 ID (不可更改)</label>
-                <div className="bg-slate-950 border border-slate-800 px-3 py-2 rounded text-slate-400 font-mono text-sm">
+                <div className="bg-slate-950 border border-slate-800 px-3 py-2 rounded text-slate-400 font-mono text-sm select-all">
                   <span>{editingDeviceId}</span>
                 </div>
               </div>
@@ -180,207 +225,211 @@ export default function App() {
                   type="text" 
                   value={editingName} 
                   onChange={(e) => setEditingName(e.target.value)} 
-                  className="bg-slate-950 border border-slate-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500/50 text-slate-200 placeholder-slate-600" 
+                  className="bg-slate-950 border border-slate-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-indigo-500/50 text-slate-200 placeholder-slate-600" 
                   placeholder="例如：大厅主屏幕" 
                 />
-              </div>
-              <div className="grid grid-cols-2 gap-4 pt-2">
-                <div className="flex flex-col gap-1">
-                  <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">连接状态</span>
-                  <span className="text-sm font-medium flex items-center gap-1">
-                    {editingDeviceId === currentDeviceId ? (
-                      <span className="text-emerald-400 flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span> 正在控制</span>
-                    ) : (
-                      <span className="text-slate-400 flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-slate-600"></span> 就绪</span>
-                    )}
-                  </span>
-                </div>
-                <div className="flex flex-col gap-1">
-                  <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">数据加密</span>
-                  <span className="text-sm font-medium text-slate-300 flex items-center gap-1">
-                    <Lock className="w-4 h-4 text-emerald-500" /> 裸流直连
-                  </span>
-                </div>
               </div>
             </div>
             <div className="px-6 py-4 border-t border-slate-800 bg-slate-900/50 flex justify-end gap-3">
               <button onClick={() => setModalOpen(false)} className="px-4 py-2 rounded text-xs font-bold uppercase tracking-wider text-slate-400 hover:text-slate-200 transition-colors">取消</button>
-              <button onClick={saveDeviceDetails} className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-slate-950 rounded text-xs font-bold uppercase tracking-wider transition-colors shadow-[0_0_12px_rgba(16,185,129,0.3)]">保存更改</button>
+              <button onClick={saveDeviceDetails} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-xs font-bold uppercase tracking-wider transition-colors shadow-[0_0_12px_rgba(99,102,241,0.3)]">保存更改</button>
             </div>
           </div>
         </div>
       )}
 
-      {/* Header */}
-      <header className="h-14 bg-slate-900 border-b border-slate-800 flex items-center justify-between px-6 shrink-0">
-        <div className="flex items-center gap-4">
-          <div className="flex items-center gap-2">
-            <div className={`w-3 h-3 rounded-full ${status === 'connected' ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.6)]' : status === 'loading' ? 'bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.6)]' : 'bg-red-500'}`}></div>
-            <span className="font-bold tracking-tight text-slate-100 flex items-center gap-2">
-              <Monitor className="w-5 h-5 text-emerald-500" /> EXHIBITION REMOTE HUB <span className="text-slate-500 font-normal ml-2">v1.0.4-stable</span>
-            </span>
-          </div>
-          <div className="h-4 w-px bg-slate-700"></div>
-          <div className="flex items-center gap-2">
-            <input 
-              type="text" 
-              value={serverUrl} 
-              onChange={e => setServerUrl(e.target.value)} 
-              className="bg-slate-950 border border-slate-700 rounded px-3 py-1.5 text-xs focus:outline-none focus:border-emerald-500/50 text-slate-300 w-56 font-mono" 
-              placeholder="服务端地址" 
-            />
-            <button onClick={loadDevices} className="px-3 py-1.5 bg-slate-800 border border-slate-700 rounded hover:bg-slate-700 text-xs font-bold uppercase transition-all text-slate-300">刷新设备</button>
-          </div>
-        </div>
-        <div className="flex items-center gap-6 text-xs">
-          <div className="flex flex-col items-end">
-            <span className="text-slate-500 uppercase font-bold tracking-wider text-[10px]">状态</span>
-            <span className="font-mono text-slate-300 font-bold">
-              {status === 'connected' ? '已连接' : status === 'loading' ? '加载中...' : '未连接'}
-            </span>
-          </div>
-          {status === 'connected' && (
-            <button onClick={disconnectDevice} className="px-4 py-2 bg-red-900/20 border border-red-500/30 text-red-400 rounded hover:bg-red-900/40 hover:text-red-300 font-bold uppercase transition-all tracking-wider text-[10px]">
-              断开连接
-            </button>
-          )}
-        </div>
-      </header>
-
-      {/* Main Content */}
-      <main className="flex flex-1 overflow-hidden">
-        {/* Sidebar */}
-        <aside className="w-72 bg-slate-900/50 border-r border-slate-800 flex flex-col">
-          <div className="p-4 border-b border-slate-800">
-            <div className="text-[10px] text-slate-500 uppercase font-bold tracking-widest flex justify-between items-center">
-              <span>在线设备</span>
-              <span className="text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">{devices.length}</span>
+      {viewMode === 'devices' ? (
+        <div className="flex flex-col h-full">
+          {/* Header */}
+          <header className="h-16 bg-slate-900 border-b border-slate-800 flex items-center justify-between px-8 shrink-0">
+            <div className="flex items-center gap-4">
+              <span className="font-bold tracking-tight text-slate-100 flex items-center gap-3 text-lg">
+                <div className="w-8 h-8 rounded-lg bg-indigo-600 flex items-center justify-center shadow-[0_0_15px_rgba(99,102,241,0.5)]">
+                  <Monitor className="w-5 h-5 text-white" />
+                </div>
+                Ultra Remote
+              </span>
             </div>
-          </div>
-          <div className="flex-1 overflow-y-auto">
-            {devices.length === 0 ? (
-              <div className="p-8 text-xs text-slate-500 text-center flex flex-col items-center gap-2">
-                {status === 'disconnected' && !devices.length ? (
-                  <>
-                    <WifiOff className="w-8 h-8 opacity-30" />
-                    <span>后端连接失败</span>
-                  </>
-                ) : (
-                  <>
-                    <Router className="w-8 h-8 opacity-30" />
-                    <span>暂无设备在线</span>
-                  </>
-                )}
-              </div>
-            ) : (
-              devices.map(id => {
-                const isActive = id === currentDeviceId;
-                const displayName = getDeviceName(id);
-                return (
-                  <div key={id} className={`p-4 transition-all group relative ${isActive ? 'bg-emerald-500/10 border-l-4 border-emerald-500' : 'border-b border-slate-800 hover:bg-slate-800/50 border-l-4 border-transparent'}`}>
-                    <div className="flex justify-between items-start mb-1">
-                      <div className="flex flex-col cursor-pointer flex-1 overflow-hidden" onClick={() => connectDevice(id)}>
-                        <span className={`font-bold text-sm truncate pr-2 ${isActive ? 'text-slate-100' : 'text-slate-400'}`}>{displayName}</span>
-                        <span className="text-[10px] text-slate-600 font-mono mt-0.5 truncate">{id}</span>
-                      </div>
-                      <div className="flex items-center gap-2 shrink-0">
-                        <button onClick={(e) => { e.stopPropagation(); openDeviceDetails(id); }} className="text-slate-500 hover:text-slate-300 transition-colors p-1 opacity-0 group-hover:opacity-100" title="设备详情 / 重命名">
-                          <Settings className="w-4 h-4" />
-                        </button>
-                        {isActive ? (
-                          <span className="text-[10px] bg-emerald-500 text-slate-950 px-1.5 py-0.5 rounded font-bold tracking-wider shadow-[0_0_8px_rgba(16,185,129,0.4)]">ACTIVE</span>
-                        ) : (
-                          <span className="text-[10px] border border-slate-600 text-slate-500 px-1.5 py-0.5 rounded font-bold tracking-wider">IDLE</span>
-                        )}
-                      </div>
-                    </div>
-                    <div className="text-[10px] text-slate-500 font-mono mt-2 flex items-center gap-1 uppercase font-bold tracking-widest cursor-pointer w-fit hover:text-slate-400 transition-colors" onClick={() => connectDevice(id)}>
-                      <Mouse className="w-3 h-3" /> Click to control
-                    </div>
-                  </div>
-                );
-              })
-            )}
-          </div>
-          <div className="p-4 border-t border-slate-800 bg-slate-900 shrink-0">
-            <div className="text-[10px] text-slate-500 mb-3 uppercase font-bold tracking-widest">终端网络统计</div>
-            <div className="grid grid-cols-2 gap-3 text-xs">
-              <div className="flex flex-col bg-slate-950 p-2 border border-slate-800 rounded">
-                <span className="text-slate-500 text-[10px] uppercase font-bold mb-1">FPS</span>
-                <span className="text-slate-200 font-mono text-sm">{fps}</span>
-              </div>
-              <div className="flex flex-col bg-slate-950 p-2 border border-slate-800 rounded">
-                <span className="text-slate-500 text-[10px] uppercase font-bold mb-1">速率 (KB/s)</span>
-                <span className="text-emerald-400 font-mono text-sm">{dataRate}</span>
-              </div>
-              <div className="flex flex-col bg-slate-950 p-2 border border-slate-800 rounded">
-                <span className="text-slate-500 text-[10px] uppercase font-bold mb-1">变化块</span>
-                <span className="text-amber-400 font-mono text-sm">{blockCount}</span>
-              </div>
-              <div className="flex flex-col bg-slate-950 p-2 border border-slate-800 rounded">
-                <span className="text-slate-500 text-[10px] uppercase font-bold mb-1">延迟 (ms)</span>
-                <span className="text-blue-400 font-mono text-sm">--</span>
-              </div>
+            <div className="flex items-center gap-4">
+              <input 
+                type="text" 
+                value={serverUrl} 
+                onChange={e => setServerUrl(e.target.value)} 
+                className="bg-slate-950 border border-slate-700 rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-indigo-500/50 text-slate-300 w-64 font-mono shadow-inner" 
+                placeholder="服务端地址" 
+              />
+              <button onClick={loadDevices} className="px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg hover:bg-slate-700 text-sm font-bold transition-all text-slate-200 shadow-sm flex items-center gap-2">
+                <Router className="w-4 h-4" /> 刷新
+              </button>
             </div>
-          </div>
-        </aside>
+          </header>
 
-        {/* Remote View */}
-        <section className="flex-1 flex flex-col bg-slate-950 relative">
-          <div className="h-12 bg-slate-900/80 backdrop-blur border-b border-slate-800 flex items-center justify-between px-6 shrink-0 z-10">
-            <div className="flex items-center gap-6">
-              <span className="text-xs font-mono text-slate-500 flex items-center gap-2">
-                当前控制: 
-                <span className={status === 'connected' ? "text-emerald-400 bg-emerald-500/10 px-1.5 rounded" : "text-slate-500"}>
-                  {status === 'connected' ? getDeviceName(currentDeviceId!) : '未连接'}
+          {/* Devices Grid */}
+          <main className="flex-1 overflow-y-auto p-8 bg-slate-950">
+            <div className="max-w-6xl mx-auto">
+              <h2 className="text-xl font-bold text-slate-100 mb-6 flex items-center gap-2">
+                <span className="w-2 h-6 bg-indigo-500 rounded-full inline-block"></span>
+                我的设备
+                <span className="ml-2 text-sm font-normal text-slate-500 bg-slate-900 px-2.5 py-0.5 rounded-full border border-slate-800">
+                  {devices.length} 台在线
                 </span>
-              </span>
-              <span className="text-xs font-mono text-slate-500 flex items-center gap-2">
-                分辨率: <span className="text-blue-400">{resolution}</span>
-              </span>
+              </h2>
+
+              {devices.length === 0 ? (
+                <div className="mt-20 flex flex-col items-center justify-center text-slate-500 gap-4">
+                  <div className="w-24 h-24 rounded-full bg-slate-900 border border-slate-800 flex items-center justify-center">
+                    <WifiOff className="w-10 h-10 opacity-40" />
+                  </div>
+                  <p className="text-lg font-medium text-slate-400">暂无在线设备</p>
+                  <p className="text-sm">请在被控端启动 Agent 程序</p>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
+                  {devices.map(device => {
+                    const id = device.id;
+                    const displayName = getDeviceName(id);
+                    return (
+                      <div 
+                        key={id} 
+                        className="bg-slate-900 border border-slate-800 rounded-xl p-5 hover:border-indigo-500/50 hover:shadow-[0_8px_30px_rgba(0,0,0,0.5)] transition-all group flex flex-col gap-4 cursor-pointer overflow-hidden"
+                        onClick={() => connectDevice(id)}
+                      >
+                        <div className="flex justify-between items-start">
+                          <div className="flex items-center gap-3">
+                            <div className="w-12 h-12 rounded-full bg-indigo-500/10 flex items-center justify-center shrink-0">
+                              <Monitor className="w-6 h-6 text-indigo-400" />
+                            </div>
+                            <div className="flex flex-col min-w-0">
+                              <span className="font-bold text-slate-100 text-lg truncate w-full" title={displayName}>{displayName}</span>
+                              <span className="text-xs text-emerald-400 flex items-center gap-1 mt-0.5">
+                                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span> 在线可用
+                              </span>
+                            </div>
+                          </div>
+                          <button onClick={(e) => openDeviceDetails(id, e)} className="text-slate-500 hover:text-white p-2 rounded-lg hover:bg-slate-800 transition-colors shrink-0">
+                            <Settings className="w-5 h-5" />
+                          </button>
+                        </div>
+                        
+                        <div className="relative w-full aspect-video bg-black rounded-lg border border-slate-800 overflow-hidden flex items-center justify-center">
+                          <img 
+                            src={`${serverUrl}/api/v1/devices/thumbnail?device_id=${id}&t=${Date.now()}`} 
+                            alt="Screen Thumbnail"
+                            className="w-full h-full object-cover opacity-70 group-hover:opacity-100 transition-opacity"
+                            onError={(e) => {
+                              (e.target as HTMLImageElement).style.display = 'none';
+                              (e.target as HTMLImageElement).parentElement!.innerHTML = '<div class="text-slate-700 flex flex-col items-center"><svg class="w-8 h-8 mb-2" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg><span class="text-xs">无缩略图</span></div>';
+                            }}
+                          />
+                          <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 bg-indigo-900/40 transition-opacity">
+                            <div className="bg-indigo-600 text-white rounded-full p-3 shadow-lg transform scale-90 group-hover:scale-100 transition-transform">
+                              <Cast className="w-6 h-6" />
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                          <div className="bg-slate-950 rounded-lg p-2.5 border border-slate-800 font-mono text-[10px] text-slate-500 truncate flex-1">
+                            ID: {id}
+                          </div>
+                          <div className="bg-slate-950 rounded-lg p-2.5 border border-slate-800 font-mono text-[10px] text-indigo-400/80 truncate shrink-0 max-w-[100px]">
+                            {device.os || 'Unknown OS'}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
-            <div className="flex gap-2 text-xs font-mono bg-slate-950 border border-slate-800 px-3 py-1 rounded">
-              <span className="text-emerald-400 font-bold">{fps} FPS</span>
+          </main>
+        </div>
+      ) : (
+        /* Remote Control View */
+        <div ref={containerRef} className="flex flex-col h-full bg-black relative">
+          
+          {/* Top Floating Toolbar (auto-hide can be added later) */}
+          <div className="absolute top-0 left-0 right-0 h-14 bg-slate-900/90 backdrop-blur-md border-b border-slate-700/50 z-40 flex items-center justify-between px-4 opacity-0 hover:opacity-100 transition-opacity duration-300" style={{ opacity: isFullscreen ? undefined : 1 }}>
+            <div className="flex items-center gap-4">
+              <button 
+                onClick={disconnectDevice}
+                className="p-2 hover:bg-slate-800 rounded-lg text-slate-300 hover:text-white transition-colors flex items-center gap-2"
+              >
+                <ChevronLeft className="w-5 h-5" />
+                <span className="font-bold text-sm">返回</span>
+              </button>
+              
+              <div className="h-6 w-px bg-slate-700 mx-2"></div>
+              
+              <div className="flex flex-col">
+                <span className="font-bold text-slate-100 text-sm leading-tight">{getDeviceName(currentDeviceId!)}</span>
+                <span className="text-[10px] text-emerald-400 font-mono leading-tight flex items-center gap-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span> 已连接
+                </span>
+              </div>
+            </div>
+
+            <div className="flex items-center bg-slate-950/50 rounded-lg border border-slate-800 p-1 gap-1">
+              <button 
+                onClick={() => setQualityMode('smooth')}
+                className={`px-3 py-1.5 rounded text-xs font-bold transition-colors flex items-center gap-1.5 ${qualityMode === 'smooth' ? 'bg-slate-700 text-white' : 'text-slate-400 hover:text-slate-200'}`}
+              >
+                <Zap className="w-3.5 h-3.5" /> 流畅
+              </button>
+              <button 
+                onClick={() => setQualityMode('balanced')}
+                className={`px-3 py-1.5 rounded text-xs font-bold transition-colors flex items-center gap-1.5 ${qualityMode === 'balanced' ? 'bg-slate-700 text-white' : 'text-slate-400 hover:text-slate-200'}`}
+              >
+                <Activity className="w-3.5 h-3.5" /> 均衡
+              </button>
+              <button 
+                onClick={() => setQualityMode('hd')}
+                className={`px-3 py-1.5 rounded text-xs font-bold transition-colors flex items-center gap-1.5 ${qualityMode === 'hd' ? 'bg-slate-700 text-white' : 'text-slate-400 hover:text-slate-200'}`}
+              >
+                <ImageIcon className="w-3.5 h-3.5" /> 高清
+              </button>
+            </div>
+
+            <div className="flex items-center gap-4">
+              <div className="flex gap-4 text-xs font-mono text-slate-400 mr-2">
+                <div className="flex flex-col items-end">
+                  <span className="text-[9px] uppercase">FPS</span>
+                  <span className={fps > 20 ? "text-emerald-400 font-bold" : "text-amber-400 font-bold"}>{fps}</span>
+                </div>
+                <div className="flex flex-col items-end">
+                  <span className="text-[9px] uppercase">KB/s</span>
+                  <span className="text-blue-400 font-bold">{dataRate}</span>
+                </div>
+                <div className="flex flex-col items-end">
+                  <span className="text-[9px] uppercase">Res</span>
+                  <span className="text-slate-300 font-bold">{resolution}</span>
+                </div>
+              </div>
+              <button 
+                onClick={toggleFullscreen}
+                className="p-2 hover:bg-slate-800 rounded-lg text-slate-300 hover:text-white transition-colors"
+                title="全屏"
+              >
+                {isFullscreen ? <Minimize className="w-5 h-5" /> : <Maximize className="w-5 h-5" />}
+              </button>
             </div>
           </div>
 
-          <div className="flex-1 relative flex items-center justify-center overflow-hidden bg-black p-4">
+          <div className="flex-1 relative flex items-center justify-center overflow-hidden">
             <canvas 
               ref={canvasRef} 
-              className="w-full h-full object-contain cursor-crosshair relative z-10 shadow-2xl"
+              className="w-full h-full object-contain cursor-crosshair z-10"
+              style={{ filter: qualityMode === 'smooth' ? 'contrast(1.05)' : 'none' }} // Fake visual feedback for modes
             />
-
-            {status !== 'connected' && (
-              <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950 text-slate-500 pointer-events-none transition-opacity z-20">
-                <div className="w-32 h-32 mb-6 rounded-full bg-slate-900 flex items-center justify-center border border-slate-800 shadow-inner">
-                  <Cast className="w-16 h-16 opacity-40" />
-                </div>
-                <span className="text-xl font-medium text-slate-300 mb-2 tracking-wide">等待建立连接...</span>
-                <span className="text-sm">请在左侧列表选择一台设备以接收画面流</span>
-              </div>
-            )}
-
-            <div className="absolute top-8 right-8 bg-slate-900/80 backdrop-blur border border-slate-800 p-3 rounded font-mono text-[10px] flex flex-col gap-1.5 pointer-events-none z-30 shadow-xl">
-              <div className="flex justify-between gap-10"><span className="text-slate-500">PROTOCOL</span><span className="text-emerald-400">WS-BINARY</span></div>
-              <div className="flex justify-between gap-10"><span className="text-slate-500">COMPRESSION</span><span className="text-amber-400">TurboJPEG</span></div>
-              <div className="flex justify-between gap-10"><span className="text-slate-500">RENDERER</span><span className="text-blue-400">HTML5 Canvas</span></div>
-            </div>
             
-            <div className="absolute bottom-8 left-8 flex gap-3 pointer-events-none z-30">
-              <div className="bg-slate-900/80 backdrop-blur border border-slate-800 px-3 py-1.5 rounded text-[10px] text-slate-400 font-bold uppercase tracking-widest shadow-xl flex items-center gap-1.5">
-                {status === 'connected' ? (
-                  <><span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span> <span className="text-emerald-400">流传输中</span></>
-                ) : (
-                  <><span className="w-1.5 h-1.5 rounded-full bg-slate-600"></span> 未连接</>
-                )}
-              </div>
-              <div className="bg-slate-900/80 backdrop-blur border border-slate-800 px-3 py-1.5 rounded text-[10px] text-slate-400 font-bold uppercase tracking-widest shadow-xl flex items-center gap-1.5">
-                {keyboardCaptured ? <span className="text-emerald-400">键盘已捕获</span> : "键盘未捕获"}
+            <div className="absolute bottom-6 right-6 flex gap-2 pointer-events-none z-30 opacity-70">
+              <div className="bg-slate-900/80 backdrop-blur border border-slate-800 px-3 py-1.5 rounded text-[10px] text-slate-300 font-bold flex items-center gap-2">
+                {keyboardCaptured ? <span className="text-emerald-400">⌨️ 已捕获</span> : "⌨️ 未捕获"}
               </div>
             </div>
           </div>
-        </section>
-      </main>
+        </div>
+      )}
     </div>
   );
 }

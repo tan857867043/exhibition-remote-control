@@ -182,7 +182,30 @@ async fn main() {
     let mut status_log_timer = std::time::Instant::now();
     let mut first_frame = true;
 
-    let url = "ws://127.0.0.1:8080/agent/register?device_id=exhibition_screen_1";
+    // Generate or load Device ID
+    let device_id = std::fs::read_to_string(".device_id").unwrap_or_else(|_| {
+        let mut sys = System::new_all();
+        sys.refresh_all();
+        let host = System::host_name().unwrap_or_else(|| "UnknownHost".to_string());
+        let new_id = format!("{}_{}_{}", host, std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+        // Simple hash to make it look like an ID
+        let hash = crc32fast::hash(new_id.as_bytes());
+        let id_str = format!("{:08x}", hash);
+        let _ = std::fs::write(".device_id", &id_str);
+        id_str
+    }).trim().to_string();
+
+    let mut sys = System::new_all();
+    sys.refresh_all();
+    let host_name = System::host_name().unwrap_or_else(|| "Unknown Device".to_string());
+    let os_name = System::name().unwrap_or_else(|| "Unknown OS".to_string());
+    
+    // URL encode strings
+    let host_name_encoded = host_name.replace(" ", "%20");
+    let os_name_encoded = os_name.replace(" ", "%20");
+
+    let url = format!("ws://127.0.0.1:8080/agent/register?device_id={}&device_name={}&os={}", device_id, host_name_encoded, os_name_encoded);
+
     println!("Connecting to hub at {}", url);
     let (ws_stream, _) = tokio_tungstenite::connect_async(url).await.expect("Failed to connect");
     let (mut write, mut read) = ws_stream.split();
