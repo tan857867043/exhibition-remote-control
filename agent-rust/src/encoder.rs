@@ -59,26 +59,3 @@ pub fn build_binary_packet(
 
 /// 极致性能的最近邻降采样（降至 1/2 分辨率）
 /// 专用于视频播放等高动态画面，CPU 和带宽高达 4 倍优化
-pub fn downscale_bgra_half(
-    frame: &[u8],
-    width: usize,
-    height: usize,
-    out: &mut Vec<u8>,
-) {
-    let half_w = width / 2;
-    let half_h = height / 2;
-    let row_bytes = width * 4;
-    out.clear();
-    out.reserve(half_w * half_h * 4);
-
-    for y in 0..half_h {
-        let mut row_idx = (y * 2) * row_bytes;
-        for _x in 0..half_w {
-            out.push(frame[row_idx]);
-            out.push(frame[row_idx + 1]);
-            out.push(frame[row_idx + 2]);
-            out.push(255);
-            row_idx += 8; // 跳过一个像素
-        }
-    }
-}

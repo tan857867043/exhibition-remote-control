@@ -50,7 +50,7 @@ impl QualityEngine {
             framerate: 30,
             keyframe_interval: 60,
             frame_count: 0,
-            target_rate_kbps: 8000.0,
+            target_rate_kbps: 50000.0,
             avg_encode_ms: 0.0,
             avg_send_kbps: 0.0,
         }
@@ -276,7 +276,6 @@ async fn main() {
 
     // === 优化2: 预分配可复用 buffer，避免高频 malloc ===
     let mut block_buffer: Vec<u8> = Vec::with_capacity(grid_size * grid_size * 4);
-    let mut downscale_buffer: Vec<u8> = Vec::with_capacity((screen_w / 2) * (screen_h / 2) * 4);
 
     // 主循环：捕获→检测→自适应→编码→非阻塞发送
     loop {
@@ -294,6 +293,7 @@ async fn main() {
             first_frame = false;
 
             compressor.set_quality(quality_engine.quality);
+            compressor.set_subsamp(if is_video { turbojpeg::Subsamp::Sub2x2 } else { turbojpeg::Subsamp::Sub2x2 }); // Actually Sub2x2 is 4:2:0. Let's just use Sub2x2 for everything.
 
             let mut frame_send_bytes = 0usize;
             let mut encode_total_ms = 0u64;
@@ -302,28 +302,15 @@ async fn main() {
             if is_video || force_key || (dirty_blocks.len() as f32) > (grid_mgr.last_hashes.len() as f32 * 0.45) {
                 // 全帧模式
                 let encode_start = std::time::Instant::now();
-                let jpeg_bytes_result = if is_video && screen_w >= 1280 {
-                    // 视频模式下动态降采样，性能提升 4 倍
-                    encoder::downscale_bgra_half(&frame_data, screen_w, screen_h, &mut downscale_buffer);
-                    compressor.compress_to_vec(Image {
-                        pixels: &downscale_buffer, width: screen_w / 2, height: screen_h / 2, pitch: (screen_w / 2) * 4, format: PixelFormat::BGRA,
-                    })
-                } else {
-                    compressor.compress_to_vec(Image {
-                        pixels: &frame_data, width: screen_w, height: screen_h, pitch: screen_w * 4, format: PixelFormat::BGRA,
-                    })
-                };
-
-                if let Ok(jpeg_bytes) = jpeg_bytes_result {
+                if let Ok(jpeg_bytes) = compressor.compress_to_vec(Image {
+                    pixels: &frame_data, width: screen_w, height: screen_h, pitch: screen_w * 4, format: PixelFormat::BGRA,
+                }) {
                     encode_total_ms = encode_start.elapsed().as_millis() as u64;
                     frame_send_bytes = jpeg_bytes.len();
                     
-                    let out_w = if is_video && screen_w >= 1280 { screen_w as u16 / 2 } else { screen_w as u16 };
-                    let out_h = if is_video && screen_w >= 1280 { screen_h as u16 / 2 } else { screen_h as u16 };
-
                     // 优化1: 非阻塞 try_send，通道满则丢弃
                     if tx.try_send(Message::Binary(
-                        build_binary_packet(0x02, 0, 0, out_w, out_h, &jpeg_bytes)
+                        build_binary_packet(0x02, 0, 0, screen_w as u16, screen_h as u16, &jpeg_bytes)
                     )).is_err() {
                         network_dropped = true;
                     }
