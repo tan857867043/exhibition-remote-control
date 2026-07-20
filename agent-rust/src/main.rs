@@ -299,23 +299,15 @@ async fn main() {
 
             if is_video || force_key || (dirty_blocks.len() as f32) > (grid_mgr.last_hashes.len() as f32 * 0.45) {
                 // 全帧模式
-                let factor: usize = if is_video { 2 } else { 1 };
-                let (pixels, w, h, pitch) = if factor > 1 {
-                    (encoder::downscale_frame(&frame_data, screen_w, screen_h, factor),
-                     screen_w / factor, screen_h / factor, (screen_w / factor) * 4)
-                } else {
-                    (frame_data.clone(), screen_w, screen_h, screen_w * 4)
-                };
-
                 let encode_start = std::time::Instant::now();
                 if let Ok(jpeg_bytes) = compressor.compress_to_vec(Image {
-                    pixels: &pixels, width: w, height: h, pitch, format: PixelFormat::BGRA,
+                    pixels: &frame_data, width: screen_w, height: screen_h, pitch: screen_w * 4, format: PixelFormat::BGRA,
                 }) {
                     encode_total_ms = encode_start.elapsed().as_millis() as u64;
                     frame_send_bytes = jpeg_bytes.len();
                     // 优化1: 非阻塞 try_send，通道满则丢弃（宁可掉帧也不卡捕获）
                     let _ = tx.try_send(Message::Binary(
-                        build_binary_packet(0x02, 0, 0, w as u16, h as u16, &jpeg_bytes)
+                        build_binary_packet(0x02, 0, 0, screen_w as u16, screen_h as u16, &jpeg_bytes)
                     ));
                 }
             } else if !dirty_blocks.is_empty() {

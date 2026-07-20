@@ -1,27 +1,5 @@
 use crate::dirty_rect::DirtyBlock;
 
-// 简单的降采样，由于原始数据通常是 BGRA 格式，我们需要抽取像素
-pub fn downscale_frame(frame: &[u8], width: usize, height: usize, factor: usize) -> Vec<u8> {
-    let new_width = width / factor;
-    let new_height = height / factor;
-    let mut low_res = Vec::with_capacity(new_width * new_height * 4);
-
-    for y in 0..new_height {
-        for x in 0..new_width {
-            let src_x = x * factor;
-            let src_y = y * factor;
-            let src_idx = (src_y * width + src_x) * 4;
-            
-            if src_idx + 4 <= frame.len() {
-                low_res.extend_from_slice(&frame[src_idx..src_idx + 4]);
-            } else {
-                low_res.extend_from_slice(&[0, 0, 0, 255]);
-            }
-        }
-    }
-    low_res
-}
-
 /// 提取脏块的 BGRA 像素数据到外部传入的可复用 buffer（原地覆写，避免高频 malloc）
 /// 越界行填充黑色（安全兜底），保证 buffer 长度始终 = block.w * block.h * 4
 pub fn extract_block_rgba_into(
