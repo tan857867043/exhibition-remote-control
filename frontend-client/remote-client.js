@@ -37,6 +37,8 @@ class ExhibitionRemoteClient {
         const wsUrl = this.serverUrl.replace(/^http/, 'ws');
         this.ws = new WebSocket(`${wsUrl}/api/v1/stream?device_id=${this.deviceId}`);
         this.ws.binaryType = 'arraybuffer';
+        this.pendingTasks = [];
+        this.processing = false;
 
         this.ws.onmessage = (event) => {
             const buffer = event.data;
@@ -47,55 +49,62 @@ class ExhibitionRemoteClient {
             const w = view.getUint16(5);
             const h = view.getUint16(7);
 
-            const seq = ++this.frameSeq;
             const jpegData = new Uint8Array(buffer, 9);
 
-            // 反馈统计（block count 等）
+            // 反馈统计
             this.onStats({ type: 'frame', frameType, byteLength: buffer.byteLength });
 
-            createImageBitmap(new Blob([jpegData], { type: 'image/jpeg' }))
-                .then(bitmap => {
-                    if (seq <= this.lastRendered) {
-                        bitmap.close();
-                        return;
-                    }
-                    this.lastRendered = seq;
-
-                    if (frameType === 0x02) {
-                        // 全帧：记录最大分辨率（即原始屏幕分辨率）
-                        if (w > this.maxFullW) this.maxFullW = w;
-                        if (h > this.maxFullH) this.maxFullH = h;
-
-                        this.canvas.width = w;
-                        this.canvas.height = h;
-                        this.ctx.drawImage(bitmap, 0, 0, w, h);
-                    } else {
-                        // 增量块：坐标是原始屏幕分辨率下的，需要按比例缩放到当前 canvas
-                        const scaleX = this.maxFullW > 0 ? this.canvas.width / this.maxFullW : 1;
-                        const scaleY = this.maxFullH > 0 ? this.canvas.height / this.maxFullH : 1;
-                        const dx = Math.round(x * scaleX);
-                        const dy = Math.round(y * scaleY);
-                        const dw = Math.max(1, Math.round(w * scaleX));
-                        const dh = Math.max(1, Math.round(h * scaleY));
-
-                        // 诊断：每 50 帧打印一次坐标，方便与后端日志对照
-                        if (seq % 50 === 0) {
-                            console.log(`[blk #${seq}] raw=(${x},${y},${w}x${h}) -> canvas(${this.canvas.width}x${this.canvas.height}) maxFull(${this.maxFullW}x${this.maxFullH}) scale=(${scaleX.toFixed(2)},${scaleY.toFixed(2)}) draw=(${dx},${dy},${dw}x${dh})`);
-                        }
-
-                        this.ctx.drawImage(bitmap, dx, dy, dw, dh);
-
-                        // Debug: 红色矩形框标记增量块位置
-                        if (this.debugOverlay) {
-                            this.ctx.strokeStyle = 'rgba(255, 0, 0, 0.6)';
-                            this.ctx.lineWidth = 1;
-                            this.ctx.strokeRect(dx + 0.5, dy + 0.5, dw - 1, dh - 1);
-                        }
-                    }
-                    bitmap.close();
-                })
-                .catch(err => console.error("Bitmap decode error:", err));
+            const task = {
+                frameType, x, y, w, h,
+                bitmapPromise: createImageBitmap(new Blob([jpegData], { type: 'image/jpeg' }))
+            };
+            this.pendingTasks.push(task);
+            this.processTasks();
         };
+    }
+
+    async processTasks() {
+        if (this.processing) return;
+        this.processing = true;
+
+        while (this.pendingTasks.length > 0) {
+            const task = this.pendingTasks.shift();
+            try {
+                const bitmap = await task.bitmapPromise;
+                
+                if (task.frameType === 0x02) {
+                    // 全帧：记录最大分辨率（即原始屏幕分辨率）
+                    if (task.w > this.maxFullW) this.maxFullW = task.w;
+                    if (task.h > this.maxFullH) this.maxFullH = task.h;
+
+                    this.canvas.width = task.w;
+                    this.canvas.height = task.h;
+                    this.ctx.drawImage(bitmap, 0, 0, task.w, task.h);
+                } else {
+                    // 增量块
+                    const scaleX = this.maxFullW > 0 ? this.canvas.width / this.maxFullW : 1;
+                    const scaleY = this.maxFullH > 0 ? this.canvas.height / this.maxFullH : 1;
+                    const dx = Math.round(task.x * scaleX);
+                    const dy = Math.round(task.y * scaleY);
+                    const dw = Math.max(1, Math.round(task.w * scaleX));
+                    const dh = Math.max(1, Math.round(task.h * scaleY));
+
+                    this.ctx.drawImage(bitmap, dx, dy, dw, dh);
+
+                    // Debug: 红色矩形框标记增量块位置
+                    if (this.debugOverlay) {
+                        this.ctx.strokeStyle = 'rgba(255, 0, 0, 0.6)';
+                        this.ctx.lineWidth = 1;
+                        this.ctx.strokeRect(dx + 0.5, dy + 0.5, dw - 1, dh - 1);
+                    }
+                }
+                bitmap.close();
+            } catch (err) {
+                console.error("Bitmap decode error:", err);
+            }
+        }
+        
+        this.processing = false;
     }
 
     // ---- 坐标换算 ----
@@ -111,15 +120,22 @@ class ExhibitionRemoteClient {
 
     // ---- 发送控制命令 ----
     sendControl(action, extra = {}) {
-        fetch(`${this.serverUrl}/api/v1/control`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                device_id: this.deviceId,
-                action: action,
-                ...extra
-            })
-        }).catch(err => { /* 静默忽略，高频事件会产生大量错误 */ });
+        const payload = JSON.stringify({
+            device_id: this.deviceId,
+            action: action,
+            ...extra
+        });
+
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.ws.send(payload);
+        } else {
+            // 回退到 HTTP 或静默
+            fetch(`${this.serverUrl}/api/v1/control`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: payload
+            }).catch(() => {});
+        }
     }
 
     // ---- 输入绑定 ----
@@ -146,6 +162,7 @@ class ExhibitionRemoteClient {
         });
 
         // mousemove → 远程 mouse_move（拖拽时或频率限制）
+        this.mouseMoveThrottle = 16; // 60fps 对应的节流
         this.canvas.addEventListener('mousemove', (e) => {
             if (!this.mouseDown) return;
             const now = Date.now();

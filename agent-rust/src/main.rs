@@ -181,8 +181,8 @@ async fn main() {
     let (mut write, mut read) = ws_stream.split();
 
     // === 优化1: MPSC 通道解耦网络发送 ===
-    // 容量 128：积压超过此值时 try_send 丢弃帧，保证捕获循环永不被网络阻塞
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(128);
+    // 容量 8192：防止高频增量块溢出导致画面撕裂
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(8192);
 
     // 专用异步发送任务
     tokio::spawn(async move {
@@ -296,6 +296,7 @@ async fn main() {
 
             let mut frame_send_bytes = 0usize;
             let mut encode_total_ms = 0u64;
+            let mut network_dropped = false;
 
             if is_video || force_key || (dirty_blocks.len() as f32) > (grid_mgr.last_hashes.len() as f32 * 0.45) {
                 // 全帧模式
@@ -305,10 +306,12 @@ async fn main() {
                 }) {
                     encode_total_ms = encode_start.elapsed().as_millis() as u64;
                     frame_send_bytes = jpeg_bytes.len();
-                    // 优化1: 非阻塞 try_send，通道满则丢弃（宁可掉帧也不卡捕获）
-                    let _ = tx.try_send(Message::Binary(
+                    // 优化1: 非阻塞 try_send，通道满则丢弃
+                    if tx.try_send(Message::Binary(
                         build_binary_packet(0x02, 0, 0, screen_w as u16, screen_h as u16, &jpeg_bytes)
-                    ));
+                    )).is_err() {
+                        network_dropped = true;
+                    }
                 }
             } else if !dirty_blocks.is_empty() {
                 // 增量模式：连通分量包围盒合并（参照 VNC/X11 Damage 做法）
@@ -332,10 +335,15 @@ async fn main() {
                         if tx.try_send(Message::Binary(
                             build_binary_packet(0x01, block.x, block.y, block.w, block.h, &jpeg_bytes)
                         )).is_err() {
+                            network_dropped = true;
                             break;
                         }
                     }
                 }
+            }
+
+            if network_dropped {
+                grid_mgr.last_hashes.fill(0);
             }
 
             // 带宽统计

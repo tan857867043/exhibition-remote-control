@@ -158,10 +158,21 @@ func handleStreamSubscribe(w http.ResponseWriter, r *http.Request) {
 		conn.Close()
 	}()
 
-	// 挂起连接持续等待监听退订事件
+	// 挂起连接持续等待监听退订事件和控制指令
 	for {
-		if _, _, err := conn.ReadMessage(); err != nil {
+		messageType, payload, err := conn.ReadMessage()
+		if err != nil {
 			break
+		}
+
+		// 将客户端发来的 WebSocket 文本消息（控制指令）透传给 Agent，降低控制延迟
+		if messageType == websocket.TextMessage {
+			GlobalHub.mu.RLock()
+			agentConn, exists := GlobalHub.Agents[deviceID]
+			GlobalHub.mu.RUnlock()
+			if exists {
+				agentConn.WriteMessage(websocket.TextMessage, payload)
+			}
 		}
 	}
 }
