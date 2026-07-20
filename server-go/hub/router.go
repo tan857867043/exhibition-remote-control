@@ -46,6 +46,10 @@ func handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 	deviceID := r.URL.Query().Get("device_id")
 	deviceName := r.URL.Query().Get("device_name")
 	deviceOS := r.URL.Query().Get("os")
+	deviceCPU := r.URL.Query().Get("cpu")
+	deviceRAM := r.URL.Query().Get("ram")
+	deviceMAC := r.URL.Query().Get("mac")
+	deviceIP := r.RemoteAddr
 	if deviceID == "" {
 		conn.Close()
 		return
@@ -57,6 +61,10 @@ func handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 		ID:   deviceID,
 		Name: deviceName,
 		OS:   deviceOS,
+		IP:   deviceIP,
+		CPU:  deviceCPU,
+		RAM:  deviceRAM,
+		MAC:  deviceMAC,
 	}
 	GlobalHub.mu.Unlock()
 

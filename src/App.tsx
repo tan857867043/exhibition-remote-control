@@ -6,10 +6,14 @@ interface DeviceInfo {
   id: string;
   name: string;
   os: string;
+  ip: string;
+  cpu: string;
+  ram: string;
+  mac: string;
 }
 
 export default function App() {
-  const [serverUrl, setServerUrl] = useState("http://127.0.0.1:8080");
+  const [serverUrl, setServerUrl] = useState("http://127.0.0.1:38921");
   const [devices, setDevices] = useState<DeviceInfo[]>([]);
   const [currentDeviceId, setCurrentDeviceId] = useState<string | null>(null);
   const [status, setStatus] = useState<"disconnected" | "loading" | "connected">("disconnected");
@@ -229,6 +233,37 @@ export default function App() {
                   placeholder="例如：大厅主屏幕" 
                 />
               </div>
+
+              {editingDeviceId && devices.find(d => d.id === editingDeviceId) && (() => {
+                const device = devices.find(d => d.id === editingDeviceId)!;
+                return (
+                  <div className="flex flex-col gap-3 pt-2">
+                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest border-b border-slate-800 pb-1">硬件与网络信息</label>
+                    <div className="grid grid-cols-2 gap-3 text-xs">
+                      <div className="flex flex-col gap-1">
+                        <span className="text-slate-500 font-mono">操作系统</span>
+                        <span className="text-slate-300">{device.os || 'Unknown'}</span>
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <span className="text-slate-500 font-mono">IP 地址</span>
+                        <span className="text-slate-300 font-mono">{device.ip || 'Unknown'}</span>
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <span className="text-slate-500 font-mono">CPU 信息</span>
+                        <span className="text-slate-300 truncate" title={device.cpu}>{device.cpu || 'Unknown'}</span>
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <span className="text-slate-500 font-mono">内存容量</span>
+                        <span className="text-slate-300">{device.ram ? `${device.ram} GB` : 'Unknown'}</span>
+                      </div>
+                      <div className="flex flex-col gap-1 col-span-2">
+                        <span className="text-slate-500 font-mono">MAC 地址</span>
+                        <span className="text-slate-300 font-mono">{device.mac || 'Unknown'}</span>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
             <div className="px-6 py-4 border-t border-slate-800 bg-slate-900/50 flex justify-end gap-3">
               <button onClick={() => setModalOpen(false)} className="px-4 py-2 rounded text-xs font-bold uppercase tracking-wider text-slate-400 hover:text-slate-200 transition-colors">取消</button>

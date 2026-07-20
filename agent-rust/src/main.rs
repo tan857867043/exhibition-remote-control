@@ -198,13 +198,28 @@ async fn main() {
     let mut sys = System::new_all();
     sys.refresh_all();
     let host_name = System::host_name().unwrap_or_else(|| "Unknown Device".to_string());
-    let os_name = System::name().unwrap_or_else(|| "Unknown OS".to_string());
+    let os_name = format!("{} {}", System::name().unwrap_or_else(|| "Unknown OS".to_string()), System::os_version().unwrap_or_default());
     
+    let cpu_brand = sys.cpus().first().map(|c| c.brand()).unwrap_or("Unknown CPU").to_string();
+    let mem_gb = (sys.total_memory() as f64 / 1_073_741_824.0).round() as u64;
+    
+    let mut mac_addr = String::new();
+    let networks = sysinfo::Networks::new_with_sysinfo();
+    for (name, data) in &networks {
+        if name != "lo" && !name.starts_with("Loopback") {
+            mac_addr = format!("{:?}", data.mac_address());
+            break;
+        }
+    }
+
     // URL encode strings
     let host_name_encoded = host_name.replace(" ", "%20");
     let os_name_encoded = os_name.replace(" ", "%20");
+    let cpu_brand_encoded = cpu_brand.replace(" ", "%20");
+    let mac_encoded = mac_addr.replace(" ", "%20");
 
-    let url = format!("ws://127.0.0.1:8080/agent/register?device_id={}&device_name={}&os={}", device_id, host_name_encoded, os_name_encoded);
+    let url = format!("ws://127.0.0.1:38921/agent/register?device_id={}&device_name={}&os={}&cpu={}&ram={}GB&mac={}", 
+        device_id, host_name_encoded, os_name_encoded, cpu_brand_encoded, mem_gb, mac_encoded);
 
     println!("Connecting to hub at {}", url);
     let (ws_stream, _) = tokio_tungstenite::connect_async(url).await.expect("Failed to connect");

@@ -9,6 +9,10 @@ type DeviceInfo struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
 	OS   string `json:"os"`
+	IP   string `json:"ip"`
+	CPU  string `json:"cpu"`
+	RAM  string `json:"ram"`
+	MAC  string `json:"mac"`
 }
 
 // 核心状态数据结构：维护设备通道与订阅者的广播池
