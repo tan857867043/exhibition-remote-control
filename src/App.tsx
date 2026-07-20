@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import ExhibitionRemoteClient from "./lib/ExhibitionRemoteClient.js";
-import { Monitor, WifiOff, Settings, Mouse, Cast, Lock, Terminal, Router, X, Maximize, Minimize, ChevronLeft, Zap, Image as ImageIcon, Activity } from "lucide-react";
+import { Monitor, WifiOff, Settings, Mouse, Cast, Lock, Terminal, Router, X, Maximize, Minimize, ChevronLeft, Zap, Image as ImageIcon, Activity, Download, Copy, Check } from "lucide-react";
 
 interface DeviceInfo {
   id: string;
@@ -38,6 +38,15 @@ export default function App() {
   const [modalOpen, setModalOpen] = useState(false);
   const [editingDeviceId, setEditingDeviceId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
+  const [copiedField, setCopiedField] = useState<string | null>(null);
+
+  const copyToClipboard = async (text: string, field: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedField(field);
+      setTimeout(() => setCopiedField(null), 1500);
+    } catch { /* ignore */ }
+  };
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -204,74 +213,76 @@ export default function App() {
   return (
     <div className="flex flex-col h-screen w-full overflow-hidden bg-slate-950 text-slate-200 font-sans select-none">
       {/* Modal */}
-      {modalOpen && (
-        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center">
-          <div className="bg-slate-900 border border-slate-700 rounded-xl shadow-2xl w-full max-w-md overflow-hidden flex flex-col">
+      {modalOpen && (() => {
+        const device = editingDeviceId ? devices.find(d => d.id === editingDeviceId) : undefined;
+        return (
+        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center" onClick={() => setModalOpen(false)}>
+          <div className="bg-slate-900 border border-slate-700 rounded-xl shadow-2xl w-full max-w-lg overflow-hidden flex flex-col" onClick={e => e.stopPropagation()}>
             <div className="px-6 py-4 border-b border-slate-800 flex justify-between items-center bg-slate-900/50">
               <h3 className="text-lg font-bold text-slate-100 flex items-center gap-2">
                 <Terminal className="w-5 h-5 text-indigo-500" />
                 设备详情
               </h3>
-              <button onClick={() => setModalOpen(false)} className="text-slate-500 hover:text-slate-300">
+              <button onClick={() => setModalOpen(false)} className="text-slate-500 hover:text-slate-300 transition-colors">
                 <X className="w-5 h-5" />
               </button>
             </div>
-            <div className="p-6 flex flex-col gap-5">
-              <div className="flex flex-col gap-1.5">
-                <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">系统设备 ID (不可更改)</label>
-                <div className="bg-slate-950 border border-slate-800 px-3 py-2 rounded text-slate-400 font-mono text-sm select-all">
-                  <span>{editingDeviceId}</span>
-                </div>
-              </div>
+            <div className="p-6 flex flex-col gap-4">
+              {/* 自定义名称 */}
               <div className="flex flex-col gap-1.5">
                 <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">自定义显示名称</label>
-                <input 
-                  type="text" 
-                  value={editingName} 
-                  onChange={(e) => setEditingName(e.target.value)} 
-                  className="bg-slate-950 border border-slate-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-indigo-500/50 text-slate-200 placeholder-slate-600" 
-                  placeholder="例如：大厅主屏幕" 
-                />
+                <div className="flex gap-2">
+                  <input 
+                    type="text" 
+                    value={editingName} 
+                    onChange={(e) => setEditingName(e.target.value)} 
+                    className="flex-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-indigo-500/50 text-slate-200 placeholder-slate-600" 
+                    placeholder="例如：大厅主屏幕" 
+                  />
+                </div>
               </div>
 
-              {editingDeviceId && devices.find(d => d.id === editingDeviceId) && (() => {
-                const device = devices.find(d => d.id === editingDeviceId)!;
-                return (
-                  <div className="flex flex-col gap-3 pt-2">
-                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest border-b border-slate-800 pb-1">硬件与网络信息</label>
-                    <div className="grid grid-cols-2 gap-3 text-xs">
-                      <div className="flex flex-col gap-1">
-                        <span className="text-slate-500 font-mono">操作系统</span>
-                        <span className="text-slate-300">{device.os || 'Unknown'}</span>
-                      </div>
-                      <div className="flex flex-col gap-1">
-                        <span className="text-slate-500 font-mono">IP 地址</span>
-                        <span className="text-slate-300 font-mono">{device.ip || 'Unknown'}</span>
-                      </div>
-                      <div className="flex flex-col gap-1">
-                        <span className="text-slate-500 font-mono">CPU 信息</span>
-                        <span className="text-slate-300 truncate" title={device.cpu}>{device.cpu || 'Unknown'}</span>
-                      </div>
-                      <div className="flex flex-col gap-1">
-                        <span className="text-slate-500 font-mono">内存容量</span>
-                        <span className="text-slate-300">{device.ram ? `${device.ram} GB` : 'Unknown'}</span>
-                      </div>
-                      <div className="flex flex-col gap-1 col-span-2">
-                        <span className="text-slate-500 font-mono">MAC 地址</span>
-                        <span className="text-slate-300 font-mono">{device.mac || 'Unknown'}</span>
-                      </div>
-                    </div>
+              {/* 设备信息卡片 */}
+              {device && (
+                <div className="bg-slate-950 border border-slate-800 rounded-lg p-4 flex flex-col gap-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">设备信息</span>
+                    <span className="text-[10px] text-slate-500 bg-slate-900 px-2 py-0.5 rounded-full">
+                      {device.id === currentDeviceId ? '已连接' : '离线'}
+                    </span>
                   </div>
-                );
-              })()}
+                  {[
+                    { label: '设备 ID', value: device.id, key: 'id' },
+                    { label: '系统名称', value: device.name || 'Unknown', key: 'name' },
+                    { label: '操作系统', value: device.os || 'Unknown', key: 'os' },
+                    { label: 'IP 地址', value: device.ip || 'Unknown', key: 'ip' },
+                    { label: 'CPU', value: device.cpu || 'Unknown', key: 'cpu' },
+                    { label: '内存', value: device.ram ? `${device.ram}` : 'Unknown', key: 'ram' },
+                    { label: 'MAC', value: device.mac || 'Unknown', key: 'mac' },
+                  ].map(({ label, value, key }) => (
+                    <div key={key} className="flex items-center justify-between group">
+                      <span className="text-[11px] text-slate-500 w-16 shrink-0">{label}</span>
+                      <code className="text-xs text-slate-300 truncate ml-2 flex-1 text-right font-mono">{value}</code>
+                      <button 
+                        onClick={() => copyToClipboard(value, key)} 
+                        className="ml-2 p-1 rounded text-slate-600 hover:text-slate-300 hover:bg-slate-800 transition-all opacity-0 group-hover:opacity-100"
+                        title="复制"
+                      >
+                        {copiedField === key ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
             <div className="px-6 py-4 border-t border-slate-800 bg-slate-900/50 flex justify-end gap-3">
-              <button onClick={() => setModalOpen(false)} className="px-4 py-2 rounded text-xs font-bold uppercase tracking-wider text-slate-400 hover:text-slate-200 transition-colors">取消</button>
-              <button onClick={saveDeviceDetails} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-xs font-bold uppercase tracking-wider transition-colors shadow-[0_0_12px_rgba(99,102,241,0.3)]">保存更改</button>
+              <button onClick={() => setModalOpen(false)} className="px-4 py-2 rounded-lg text-xs font-bold uppercase tracking-wider text-slate-400 hover:text-slate-200 transition-colors">取消</button>
+              <button onClick={saveDeviceDetails} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-bold uppercase tracking-wider transition-colors shadow-[0_0_12px_rgba(99,102,241,0.3)]">保存更改</button>
             </div>
           </div>
         </div>
-      )}
+        );
+      })()}
 
       {viewMode === 'devices' ? (
         <div className="flex flex-col h-full">
@@ -296,6 +307,9 @@ export default function App() {
               <button onClick={loadDevices} className="px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg hover:bg-slate-700 text-sm font-bold transition-all text-slate-200 shadow-sm flex items-center gap-2">
                 <Router className="w-4 h-4" /> 刷新
               </button>
+              <a href={`${serverUrl}/api/v1/agent/download`} className="px-4 py-2 bg-indigo-600 border border-indigo-500 rounded-lg hover:bg-indigo-500 text-sm font-bold transition-all text-white shadow-sm flex items-center gap-2 shadow-[0_0_12px_rgba(99,102,241,0.3)]">
+                <Download className="w-4 h-4" /> 下载 Agent
+              </a>
             </div>
           </header>
 

@@ -45,17 +45,16 @@ pub fn build_binary_packet(
     y: u16,
     w: u16,
     h: u16,
+    cursor_type: u8,
     jpeg_bytes: &[u8],
 ) -> Vec<u8> {
-    let mut packet = Vec::with_capacity(9 + jpeg_bytes.len());
+    let mut packet = Vec::with_capacity(10 + jpeg_bytes.len());
     packet.push(frame_type);
     packet.extend_from_slice(&x.to_be_bytes());
     packet.extend_from_slice(&y.to_be_bytes());
     packet.extend_from_slice(&w.to_be_bytes());
     packet.extend_from_slice(&h.to_be_bytes());
+    packet.push(cursor_type);
     packet.extend_from_slice(jpeg_bytes);
     packet
 }
-
-/// 极致性能的最近邻降采样（降至 1/2 分辨率）
-/// 专用于视频播放等高动态画面，CPU 和带宽高达 4 倍优化

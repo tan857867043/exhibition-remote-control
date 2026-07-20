@@ -48,8 +48,13 @@ class ExhibitionRemoteClient {
             const y = view.getUint16(3);
             const w = view.getUint16(5);
             const h = view.getUint16(7);
+            const cursorId = buffer.byteLength > 9 ? view.getUint8(9) : 0;
 
-            const jpegData = new Uint8Array(buffer, 9);
+            const jpegData = new Uint8Array(buffer, 10);
+
+            // 映射光标类型到 CSS cursor
+            const cursorMap = ['default', 'text', 'pointer', 'ns-resize', 'ew-resize', 'wait', 'crosshair', 'move', 'nesw-resize', 'nwse-resize'];
+            this.canvas.style.cursor = cursorMap[cursorId] || 'default';
 
             // 反馈统计
             this.onStats({ type: 'frame', frameType, byteLength: buffer.byteLength });
@@ -107,14 +112,33 @@ class ExhibitionRemoteClient {
         this.processing = false;
     }
 
-    // ---- 坐标换算 ----
+    // ---- 坐标换算 (处理 object-contain 黑边) ----
     screenToRemote(clientX, clientY) {
         const rect = this.canvas.getBoundingClientRect();
-        const scaleX = this.maxFullW || this.canvas.width;
-        const scaleY = this.maxFullH || this.canvas.height;
+        const remoteW = this.maxFullW || this.canvas.width;
+        const remoteH = this.maxFullH || this.canvas.height;
+
+        // 计算 object-contain 实际显示区域（会有 letterbox 黑边）
+        const canvasAspect = rect.width / rect.height;
+        const remoteAspect = remoteW / remoteH;
+        let drawW, drawH, offsetX, offsetY;
+        if (canvasAspect > remoteAspect) {
+            // canvas 更宽 → 左右黑边
+            drawH = rect.height;
+            drawW = drawH * remoteAspect;
+            offsetX = (rect.width - drawW) / 2;
+            offsetY = 0;
+        } else {
+            // canvas 更高 → 上下黑边
+            drawW = rect.width;
+            drawH = drawW / remoteAspect;
+            offsetX = 0;
+            offsetY = (rect.height - drawH) / 2;
+        }
+
         return {
-            x: Math.round(((clientX - rect.left) / rect.width) * scaleX),
-            y: Math.round(((clientY - rect.top) / rect.height) * scaleY)
+            x: Math.round(((clientX - rect.left - offsetX) / drawW) * remoteW),
+            y: Math.round(((clientY - rect.top - offsetY) / drawH) * remoteH)
         };
     }
 
