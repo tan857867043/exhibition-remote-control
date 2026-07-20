@@ -285,7 +285,26 @@ async fn main() {
                         }
                         "key_press" => {
                             if let Some(ref key_str) = cmd.key {
-                         // === 优化2: 预分配可复用 buffer，避免高频 malloc ===
+                                if let Some(key) = map_key(key_str) {
+                                    enigo.key_down(key);
+                                }
+                            }
+                        }
+                        "key_release" => {
+                            if let Some(ref key_str) = cmd.key {
+                                if let Some(key) = map_key(key_str) {
+                                    enigo.key_up(key);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    });
+
+    // === 优化2: 预分配可复用 buffer，避免高频 malloc ===
     let mut block_buffer: Vec<u8> = Vec::with_capacity(grid_size * grid_size * 4);
 
     // === 核心优化: 将繁重的 CPU 捕获和压缩剥离到独立的 OS 线程 ===
