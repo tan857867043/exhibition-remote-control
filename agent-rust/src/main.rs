@@ -64,12 +64,12 @@ impl QualityEngine {
 
         // 动态帧率与画质权衡 (视频模式保帧率降画质，静态模式保画质降帧率)
         if change_ratio > 0.40 {
-            // 大面积变化 (视频播放)：极速帧率，极低画质
-            self.framerate = 60;
-            self.quality = (self.quality - 15).max(self.min_quality);
-        } else if change_ratio > 0.15 {
+            // 大面积变化 (视频播放)：降低最高帧率至 30 FPS 以保护 CPU，画质保持及格线
             self.framerate = 30;
-            self.quality = (self.quality - 5).max(45);
+            self.quality = (self.quality - 8).max(50);
+        } else if change_ratio > 0.15 {
+            self.framerate = 20;
+            self.quality = (self.quality - 3).max(65);
         } else if change_ratio > 0.02 {
             self.framerate = 15;
             self.quality = (self.quality + 2).min(80);
@@ -262,121 +262,109 @@ async fn main() {
                         }
                         "key_press" => {
                             if let Some(ref key_str) = cmd.key {
-                                if let Some(key) = map_key(key_str) {
-                                    enigo.key_down(key);
-                                }
+                         // === 优化2: 预分配可复用 buffer，避免高频 malloc ===
+    let mut block_buffer: Vec<u8> = Vec::with_capacity(grid_size * grid_size * 4);
+
+    // === 核心优化: 将繁重的 CPU 捕获和压缩剥离到独立的 OS 线程 ===
+    // 这样就不会阻塞 Tokio 的异步网络 I/O（WebSocket 读写可以极速响应）
+    std::thread::spawn(move || {
+        // 主循环：捕获→检测→自适应→编码→非阻塞发送
+        loop {
+            let frame_start = std::time::Instant::now();
+
+            if let Some(frame_data) = capturer.capture_frame() {
+                let (dirty_blocks, change_ratio) = grid_mgr.detect_dirty_blocks(&frame_data);
+
+                // === 优化3: 从 AtomicU32 读取节流后的 CPU 负载 ===
+                let cpu_load = CPU_LOAD.load(Ordering::Relaxed) as f32 / 10.0;
+
+                let is_video = !first_frame && change_ratio > 0.50;
+                let _is_static = change_ratio < 0.02;
+                let force_key = quality_engine.need_keyframe();
+                first_frame = false;
+
+                compressor.set_quality(quality_engine.quality);
+                compressor.set_subsamp(if is_video { turbojpeg::Subsamp::Sub2x2 } else { turbojpeg::Subsamp::None });
+
+                let mut frame_send_bytes = 0usize;
+                let mut encode_total_ms = 0u64;
+                let mut network_dropped = false;
+
+                if is_video || force_key || (dirty_blocks.len() as f32) > (grid_mgr.last_hashes.len() as f32 * 0.45) {
+                    // 全帧模式
+                    let encode_start = std::time::Instant::now();
+                    if let Ok(jpeg_bytes) = compressor.compress_to_vec(Image {
+                        pixels: &frame_data, width: screen_w, height: screen_h, pitch: screen_w * 4, format: PixelFormat::BGRA,
+                    }) {
+                        encode_total_ms = encode_start.elapsed().as_millis() as u64;
+                        frame_send_bytes = jpeg_bytes.len();
+                        
+                        // 优化1: 非阻塞 try_send，通道满则丢弃
+                        if tx.try_send(Message::Binary(
+                            build_binary_packet(0x02, 0, 0, screen_w as u16, screen_h as u16, &jpeg_bytes)
+                        )).is_err() {
+                            network_dropped = true;
+                        }
+                    }
+                } else if !dirty_blocks.is_empty() {
+                    // 增量模式：连通分量包围盒合并（参照 VNC/X11 Damage 做法）
+                    let merged = grid_mgr.merge_connected_components(&dirty_blocks);
+                    for block in &merged {
+                        // 优化2: 复用 block_buffer，clear + 原地覆写
+                        extract_block_rgba_into(&frame_data, block, screen_w, &mut block_buffer);
+                        let encode_start = std::time::Instant::now();
+                        if let Ok(jpeg_bytes) = compressor.compress_to_vec(Image {
+                            pixels: &block_buffer,
+                            width: block.w as usize,
+                            height: block.h as usize,
+                            pitch: block.w as usize * 4,
+                            format: PixelFormat::BGRA,
+                        }) {
+                            encode_total_ms += encode_start.elapsed().as_millis() as u64;
+                            frame_send_bytes += jpeg_bytes.len();
+
+                            // 优化1: 非阻塞发送
+                            if tx.try_send(Message::Binary(
+                                build_binary_packet(0x01, block.x, block.y, block.w, block.h, &jpeg_bytes)
+                            )).is_err() {
+                                network_dropped = true;
+                                break;
                             }
                         }
-                        "key_release" => {
-                            if let Some(ref key_str) = cmd.key {
-                                if let Some(key) = map_key(key_str) {
-                                    enigo.key_up(key);
-                                }
-                            }
-                        }
-                        _ => {}
                     }
                 }
+
+                if network_dropped {
+                    grid_mgr.last_hashes.fill(0);
+                }
+
+                // 带宽统计
+                let now = std::time::Instant::now();
+                send_history.push_back((now, frame_send_bytes));
+                while send_history.front().map_or(false, |(t, _)| now.duration_since(*t).as_millis() > 1000) {
+                    send_history.pop_front();
+                }
+                let send_kbps = send_history.iter().map(|(_, b)| b).sum::<usize>() as f32 / 1024.0;
+                quality_engine.adapt(change_ratio, cpu_load, encode_total_ms, send_kbps);
+
+                if status_log_timer.elapsed().as_secs() >= 5 {
+                    quality_engine.log_status();
+                    println!("  CPU={:.0}% change={:.1}% blocks={} send={:.0}KB/s",
+                        cpu_load, change_ratio * 100.0, dirty_blocks.len(), send_kbps);
+                    status_log_timer = std::time::Instant::now();
+                }
+            }
+
+            let elapsed_ms = frame_start.elapsed().as_millis() as u64;
+            let target_ms = 1000 / quality_engine.framerate;
+            if elapsed_ms < target_ms {
+                // 因为在独立线程中，这里用标准的 std::thread::sleep 即可
+                std::thread::sleep(std::time::Duration::from_millis(target_ms - elapsed_ms));
             }
         }
     });
 
-    // === 优化2: 预分配可复用 buffer，避免高频 malloc ===
-    let mut block_buffer: Vec<u8> = Vec::with_capacity(grid_size * grid_size * 4);
-
-    // 主循环：捕获→检测→自适应→编码→非阻塞发送
-    loop {
-        let frame_start = std::time::Instant::now();
-
-        if let Some(frame_data) = capturer.capture_frame() {
-            let (dirty_blocks, change_ratio) = grid_mgr.detect_dirty_blocks(&frame_data);
-
-            // === 优化3: 从 AtomicU32 读取节流后的 CPU 负载 ===
-            let cpu_load = CPU_LOAD.load(Ordering::Relaxed) as f32 / 10.0;
-
-            let is_video = !first_frame && change_ratio > 0.50;
-            let _is_static = change_ratio < 0.02;
-            let force_key = quality_engine.need_keyframe();
-            first_frame = false;
-
-            compressor.set_quality(quality_engine.quality);
-            compressor.set_subsamp(if is_video { turbojpeg::Subsamp::Sub2x2 } else { turbojpeg::Subsamp::None });
-
-            let mut frame_send_bytes = 0usize;
-            let mut encode_total_ms = 0u64;
-            let mut network_dropped = false;
-
-            if is_video || force_key || (dirty_blocks.len() as f32) > (grid_mgr.last_hashes.len() as f32 * 0.45) {
-                // 全帧模式
-                let encode_start = std::time::Instant::now();
-                if let Ok(jpeg_bytes) = compressor.compress_to_vec(Image {
-                    pixels: &frame_data, width: screen_w, height: screen_h, pitch: screen_w * 4, format: PixelFormat::BGRA,
-                }) {
-                    encode_total_ms = encode_start.elapsed().as_millis() as u64;
-                    frame_send_bytes = jpeg_bytes.len();
-                    
-                    // 优化1: 非阻塞 try_send，通道满则丢弃
-                    if tx.try_send(Message::Binary(
-                        build_binary_packet(0x02, 0, 0, screen_w as u16, screen_h as u16, &jpeg_bytes)
-                    )).is_err() {
-                        network_dropped = true;
-                    }
-                }
-            } else if !dirty_blocks.is_empty() {
-                // 增量模式：连通分量包围盒合并（参照 VNC/X11 Damage 做法）
-                let merged = grid_mgr.merge_connected_components(&dirty_blocks);
-
-                for block in &merged {
-                    // 优化2: 复用 block_buffer，clear + 原地覆写
-                    extract_block_rgba_into(&frame_data, block, screen_w, &mut block_buffer);
-
-                    let encode_start = std::time::Instant::now();
-                    if let Ok(jpeg_bytes) = compressor.compress_to_vec(Image {
-                        pixels: &block_buffer,
-                        width: block.w as usize,
-                        height: block.h as usize,
-                        pitch: block.w as usize * 4,
-                        format: PixelFormat::BGRA,
-                    }) {
-                        encode_total_ms += encode_start.elapsed().as_millis() as u64;
-                        frame_send_bytes += jpeg_bytes.len();
-                        // 优化1: 非阻塞发送
-                        if tx.try_send(Message::Binary(
-                            build_binary_packet(0x01, block.x, block.y, block.w, block.h, &jpeg_bytes)
-                        )).is_err() {
-                            network_dropped = true;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if network_dropped {
-                grid_mgr.last_hashes.fill(0);
-            }
-
-            // 带宽统计
-            let now = std::time::Instant::now();
-            send_history.push_back((now, frame_send_bytes));
-            while send_history.front().map_or(false, |(t, _)| now.duration_since(*t).as_millis() > 1000) {
-                send_history.pop_front();
-            }
-            let send_kbps = send_history.iter().map(|(_, b)| b).sum::<usize>() as f32 / 1024.0;
-
-            quality_engine.adapt(change_ratio, cpu_load, encode_total_ms, send_kbps);
-
-            if status_log_timer.elapsed().as_secs() >= 5 {
-                quality_engine.log_status();
-                println!("  CPU={:.0}% change={:.1}% blocks={} send={:.0}KB/s",
-                    cpu_load, change_ratio * 100.0, dirty_blocks.len(), send_kbps);
-                status_log_timer = std::time::Instant::now();
-            }
-        }
-
-        let elapsed_ms = frame_start.elapsed().as_millis() as u64;
-        let target_ms = 1000 / quality_engine.framerate;
-        if elapsed_ms < target_ms {
-            tokio::time::sleep(std::time::Duration::from_millis(target_ms - elapsed_ms)).await;
-        }
-    }
+    // 阻塞主线程，保持 Tokio 运行时存活
+    tokio::signal::ctrl_c().await.unwrap();
+    println!("Agent shutting down...");
 }
