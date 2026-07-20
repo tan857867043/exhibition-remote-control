@@ -45,8 +45,8 @@ impl QualityEngine {
     fn new() -> Self {
         Self {
             quality: 75,
-            min_quality: 50,
-            max_quality: 90,
+            min_quality: 30,
+            max_quality: 95,
             framerate: 30,
             keyframe_interval: 60,
             frame_count: 0,
@@ -62,14 +62,21 @@ impl QualityEngine {
         self.avg_encode_ms = self.avg_encode_ms * 0.7 + encode_ms as f32 * 0.3;
         self.avg_send_kbps = self.avg_send_kbps * 0.7 + send_kbps * 0.3;
 
-        if change_ratio > 0.50 {
+        // 动态帧率与画质权衡 (视频模式保帧率降画质，静态模式保画质降帧率)
+        if change_ratio > 0.40 {
+            // 大面积变化 (视频播放)：极速帧率，极低画质
             self.framerate = 60;
+            self.quality = (self.quality - 15).max(self.min_quality);
         } else if change_ratio > 0.15 {
             self.framerate = 30;
+            self.quality = (self.quality - 5).max(45);
         } else if change_ratio > 0.02 {
-            self.framerate = 10;
+            self.framerate = 15;
+            self.quality = (self.quality + 2).min(80);
         } else {
-            self.framerate = 3;
+            // 静态画面 (文本阅读)：极低帧率，最高画质 (完美清晰)
+            self.framerate = 5;
+            self.quality = (self.quality + 5).min(self.max_quality);
         }
 
         // 带宽熔断（优先级最高）
@@ -293,7 +300,7 @@ async fn main() {
             first_frame = false;
 
             compressor.set_quality(quality_engine.quality);
-            compressor.set_subsamp(if is_video { turbojpeg::Subsamp::Sub2x2 } else { turbojpeg::Subsamp::Sub2x2 }); // Actually Sub2x2 is 4:2:0. Let's just use Sub2x2 for everything.
+            compressor.set_subsamp(if is_video { turbojpeg::Subsamp::Sub2x2 } else { turbojpeg::Subsamp::None });
 
             let mut frame_send_bytes = 0usize;
             let mut encode_total_ms = 0u64;
