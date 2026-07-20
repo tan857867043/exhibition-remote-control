@@ -1,0 +1,6 @@
+{
+  "name": "Exhibition Remote Control",
+  "description": "Industrial LAN remote control system with Rust agent, Go server, and Canvas client.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

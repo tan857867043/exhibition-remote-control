@@ -1,0 +1,21 @@
+# Rust
+agent-rust/target/
+
+# Go
+server-go/vendor/
+
+# Trae IDE
+.trae/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
