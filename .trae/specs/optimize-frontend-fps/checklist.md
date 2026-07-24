@@ -1,0 +1,5 @@
+- [ ] ExhibitionRemoteClient 添加 rAF 渲染队列，消息解码后入队
+- [ ] 渲染队列实现帧淘汰（新帧替换旧帧）
+- [ ] rAF 循环正确消费队列并渲染到 canvas
+- [ ] App.tsx FPS/KB/s 统计信息改为每 2 秒更新
+- [ ] 前端显示 FPS 达到 25+

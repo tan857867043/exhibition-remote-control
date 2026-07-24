@@ -1,0 +1,22 @@
+- [ ] Task 1: xxhash64 静态帧跳过
+  - Cargo.toml 添加了 xxhash-rust 依赖
+  - capture 循环中实现全帧哈希比较
+  - 哈希未变化时跳过编码/传输
+- [ ] Task 2: GDI 回退捕获
+  - 实现了 GDI BitBlt 捕获函数
+  - scrap 失败时自动回退到 GDI
+  - 支持 --width/--height 命令行参数
+- [ ] Task 3: keyframe/delta 分离通道
+  - agent 端有双通道发送
+  - tokio::select! 同时监听两个通道
+  - 前端 ExhibitionRemoteClient.js 能区分关键帧和增量帧
+- [ ] Task 4: Bug 修复借鉴
+  - 已审查副本的 fix-screen-blackout spec
+  - 已审查副本的 fix-input-dispatch/matching spec
+  - 主项目已修复存在的同类问题
+- [ ] Task 5: 服务端认证
+  - server-go 添加了 token 认证中间件
+  - login API 可用
+  - 前端有登录页面
+- [ ] Task 6: WebSocket 压缩
+  - server-go 启用 perMessageDeflate

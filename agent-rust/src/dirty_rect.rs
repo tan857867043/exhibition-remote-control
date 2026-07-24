@@ -15,6 +15,7 @@ pub struct DirtyBlock {
     pub y: u16,
     pub w: u16,
     pub h: u16,
+    #[allow(dead_code)]
     pub data_offset: usize,
 }
 

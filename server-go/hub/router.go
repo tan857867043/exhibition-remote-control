@@ -3,7 +3,9 @@ package hub
 import (
 	"encoding/json"
 	"log"
+	"net"
 	"net/http"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -42,6 +44,9 @@ func handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Println("Upgrade error:", err)
 		return
+	}
+	if tcp, ok := conn.UnderlyingConn().(*net.TCPConn); ok {
+		tcp.SetNoDelay(true)
 	}
 	deviceID := r.URL.Query().Get("device_id")
 	deviceName := r.URL.Query().Get("device_name")
@@ -94,11 +99,17 @@ func handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 			}
 			GlobalHub.mu.RLock()
 			subs := GlobalHub.Subscribers[deviceID]
-			for subConn := range subs {
-				// 异步无阻塞流式转发原始二进制画面块
-				err := subConn.WriteMessage(websocket.BinaryMessage, payload)
-				if err != nil {
-					log.Println("Write error to sub:", err)
+			for _, sub := range subs {
+				// 非阻塞推送到通道；通道满时丢掉最旧帧让位给最新帧
+				select {
+				case sub.Ch <- payload:
+				default:
+					// 缓冲满：主动 drain 一条旧帧腾位置，确保最新帧不被丢弃
+					select {
+					case <-sub.Ch:
+					default:
+					}
+					sub.Ch <- payload
 				}
 			}
 			GlobalHub.mu.RUnlock()
@@ -188,16 +199,37 @@ func handleStreamSubscribe(w http.ResponseWriter, r *http.Request) {
 		log.Println("Upgrade error:", err)
 		return
 	}
+	if tcp, ok := conn.UnderlyingConn().(*net.TCPConn); ok {
+		tcp.SetNoDelay(true)
+	}
 	deviceID := r.URL.Query().Get("device_id")
+
+	// 创建订阅者：带缓冲通道 + 专用写 goroutine（避免 goroutine 爆炸和写锁竞争）
+	sub := &Subscriber{
+		Conn: conn,
+		Ch:   make(chan []byte, 16), // 16 帧缓冲，满则丢帧
+	}
 
 	GlobalHub.mu.Lock()
 	if GlobalHub.Subscribers[deviceID] == nil {
-		GlobalHub.Subscribers[deviceID] = make(map[*websocket.Conn]bool)
+		GlobalHub.Subscribers[deviceID] = make(map[*websocket.Conn]*Subscriber)
 	}
-	GlobalHub.Subscribers[deviceID][conn] = true
+	GlobalHub.Subscribers[deviceID][conn] = sub
 	GlobalHub.mu.Unlock()
 
+	// 专用写 goroutine：顺序读取通道消息并写入 WebSocket
+	go func() {
+		for data := range sub.Ch {
+			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			if err := conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
+				break
+			}
+		}
+		// 通道关闭时退出
+	}()
+
 	defer func() {
+		close(sub.Ch)
 		GlobalHub.mu.Lock()
 		if GlobalHub.Subscribers[deviceID] != nil {
 			delete(GlobalHub.Subscribers[deviceID], conn)

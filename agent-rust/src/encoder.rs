@@ -1,4 +1,5 @@
 use crate::dirty_rect::DirtyBlock;
+use std::time::Instant;
 
 /// 提取脏块的 BGRA 像素数据到外部传入的可复用 buffer（原地覆写，避免高频 malloc）
 /// 越界行填充黑色（安全兜底），保证 buffer 长度始终 = block.w * block.h * 4
@@ -32,11 +33,60 @@ pub fn extract_block_rgba_into(
     }
 }
 
-/// 兼容旧接口（全帧模式仍需分配，因为尺寸可能变化）
+#[allow(dead_code)]
 pub fn extract_block_rgba(frame: &[u8], block: &DirtyBlock, screen_width: usize) -> Vec<u8> {
     let mut block_data = Vec::with_capacity((block.w as usize) * (block.h as usize) * 4);
     extract_block_rgba_into(frame, block, screen_width, &mut block_data);
     block_data
+}
+
+/// 构建批量块包（旧版 v1，所有块均为 JPEG 编码）
+/// 格式: [0x01][block_count:2 BE][block1: x(2)+y(2)+w(2)+h(2)+jpeg_len(2)+jpeg_data]...
+#[allow(dead_code)]
+pub fn build_batch_packet(
+    blocks: &[(u16, u16, u16, u16, &[u8])],
+) -> Vec<u8> {
+    let mut total = 3; // type(1) + count(2)
+    for &(_, _, _, _, jpeg) in blocks {
+        total += 8 + jpeg.len(); // x(2)+y(2)+w(2)+h(2)+jpeg_len(2) + jpeg
+    }
+    let mut packet = Vec::with_capacity(total);
+    packet.push(0x01);
+    packet.extend_from_slice(&(blocks.len() as u16).to_be_bytes());
+    for &(x, y, w, h, jpeg) in blocks {
+        packet.extend_from_slice(&x.to_be_bytes());
+        packet.extend_from_slice(&y.to_be_bytes());
+        packet.extend_from_slice(&w.to_be_bytes());
+        packet.extend_from_slice(&h.to_be_bytes());
+        packet.extend_from_slice(&(jpeg.len() as u16).to_be_bytes());
+        packet.extend_from_slice(jpeg);
+    }
+    packet
+}
+
+/// 构建批量块包 v2（支持每块独立编码类型）
+/// 格式: [0x01][block_count:2 BE][block1: x(2)+y(2)+w(2)+h(2)+encoding(1)+data_len(2)+data]...
+/// encoding: 0=JPEG, 1=BGRA raw
+pub fn build_batch_packet_v2(
+    blocks: &[(u16, u16, u16, u16, u8, &[u8])],
+) -> Vec<u8> {
+    let mut total = 3; // type(1) + count(2)
+    for &(_, _, _, _, _, data) in blocks {
+        total += 9 + data.len(); // x(2)+y(2)+w(2)+h(2)+encoding(1)+data_len(2) + data
+    }
+    let mut packet = Vec::with_capacity(total);
+    packet.push(0x01);
+    packet.extend_from_slice(&(blocks.len() as u16).to_be_bytes());
+    for &(x, y, w, h, encoding, data) in blocks {
+        packet.extend_from_slice(&x.to_be_bytes());
+        packet.extend_from_slice(&y.to_be_bytes());
+        packet.extend_from_slice(&w.to_be_bytes());
+        packet.extend_from_slice(&h.to_be_bytes());
+        packet.push(encoding);
+        packet.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        packet.extend_from_slice(data);
+    }
+    packet
 }
 
 pub fn build_binary_packet(
@@ -90,6 +140,69 @@ pub fn downsample_bgra_2x(
             dst_idx += 4;
             src_idx += 8; // skip 1 pixel horizontally
         }
+    }
+}
+
+/// 脏块聚合器：收集脏块后在指定时间窗口内统一打包为批量消息
+#[allow(dead_code)]
+pub struct BatchAggregator {
+    blocks: Vec<(u16, u16, u16, u16, u8, Vec<u8>)>,
+    last_flush: Instant,
+    flush_interval_ms: u64,
+}
+
+#[allow(dead_code)]
+impl BatchAggregator {
+    pub fn new(flush_interval_ms: u64) -> Self {
+        Self {
+            blocks: Vec::with_capacity(64),
+            last_flush: Instant::now(),
+            flush_interval_ms,
+        }
+    }
+
+    /// 添加一个脏块到聚合队列
+    pub fn push(&mut self, x: u16, y: u16, w: u16, h: u16, encoding: u8, data: Vec<u8>) {
+        self.blocks.push((x, y, w, h, encoding, data));
+    }
+
+    /// 检查是否到达聚合发送时机
+    /// 返回 Some(packet) 表示需要发送，None 表示继续聚合
+    pub fn try_flush(&mut self) -> Option<Vec<u8>> {
+        if self.blocks.is_empty() {
+            return None;
+        }
+        let elapsed = self.last_flush.elapsed().as_millis() as u64;
+        if elapsed >= self.flush_interval_ms {
+            let refs: Vec<(u16, u16, u16, u16, u8, &[u8])> = self.blocks.iter()
+                .map(|(x, y, w, h, enc, data)| (*x, *y, *w, *h, *enc, data.as_slice()))
+                .collect();
+            let packet = build_batch_packet_v2(&refs);
+            self.blocks.clear();
+            self.last_flush = Instant::now();
+            Some(packet)
+        } else {
+            None
+        }
+    }
+
+    /// 强制刷新（用于帧结束或断开前）
+    pub fn force_flush(&mut self) -> Option<Vec<u8>> {
+        if self.blocks.is_empty() {
+            return None;
+        }
+        let refs: Vec<(u16, u16, u16, u16, u8, &[u8])> = self.blocks.iter()
+            .map(|(x, y, w, h, enc, data)| (*x, *y, *w, *h, *enc, data.as_slice()))
+            .collect();
+        let packet = build_batch_packet_v2(&refs);
+        self.blocks.clear();
+        self.last_flush = Instant::now();
+        Some(packet)
+    }
+
+    /// 当前缓存的脏块数量
+    pub fn len(&self) -> usize {
+        self.blocks.len()
     }
 }
 

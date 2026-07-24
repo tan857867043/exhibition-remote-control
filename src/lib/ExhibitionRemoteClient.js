@@ -58,6 +58,18 @@ class ExhibitionRemoteClient {
         this.keyBatch = [];
         this.keyBatchTimer = null;
 
+        this.cursorX = -1;
+        this.cursorY = -1;
+        this.cursorType = 0;
+        this.pendingRender = null;
+        this.rAFId = null;
+        this.frameSeq = 0;        // 帧序号，防止 async 竞态
+        this.receivedFrames = 0;  // 收到的帧计数
+        this.renderedFrames = 0;  // 实际渲染的帧计数（用于真实 FPS）
+        this._processingVideo = false; // 视频帧处理中锁，防止并发解码浪费
+
+        this.canvas.style.cursor = 'none';
+
         this._onMouseMove = (e) => this.sendMouseEvent(e);
         this._onMouseDown = (e) => this.sendMouseEvent(e);
         this._onMouseUp = (e) => this.sendMouseEvent(e);
@@ -90,69 +102,135 @@ class ExhibitionRemoteClient {
             if (typeof e.data === 'string') return;
             const buf = new Uint8Array(e.data);
             this.onStats({ type: 'frame', byteLength: buf.length });
-
-            const MIN_HEADER_SIZE = 14;
-            let offset = 0;
-            const tasks = [];
-            let hasFullFrame = false;
-            let cursorType = 0;
+            this.receivedFrames++;
             const totalSize = buf.length;
+            if (totalSize < 1) return;
 
-            while(offset + MIN_HEADER_SIZE <= totalSize) {
-                const frameType = buf[offset];
-                const x = (buf[offset+1] << 8) | buf[offset+2];
-                const y = (buf[offset+3] << 8) | buf[offset+4];
-                const w = (buf[offset+5] << 8) | buf[offset+6];
-                const h = (buf[offset+7] << 8) | buf[offset+8];
-                const jpegLen = (buf[offset+9] << 24) | (buf[offset+10] << 16) | (buf[offset+11] << 8) | buf[offset+12];
-                cursorType = buf[offset+13];
-                
-                if (frameType === 0x01) {
-                    this.onStats({ type: 'frame', frameType: 0x01, byteLength: 0 });
-                }
+            const frameType = buf[0];
 
-                const regionSize = MIN_HEADER_SIZE + jpegLen;
-                if(offset + regionSize > totalSize) break;
-                
-                if(w === 0 || h === 0 || jpegLen === 0){
-                    offset += regionSize;
-                    continue;
-                }
+            if (frameType === 0x07) {
+                // === 光标位置 ===
+                // [0x07][cursor_x:2 BE][cursor_y:2 BE]
+                if (totalSize < 5) return;
+                this.cursorX = (buf[1] << 8) | buf[2];
+                this.cursorY = (buf[3] << 8) | buf[4];
+            } else if (frameType === 0x08) {
+                // === 光标形状 ===
+                // [0x08][cursor_type:1][png_len:2 BE][png_data...]
+                if (totalSize < 4) return;
+                this.cursorType = buf[1];
+            } else if (this._processingVideo) {
+                // 视频帧(0x01~0x04)处理中锁：上一帧解码尚未完成，直接丢弃当前帧
+                // 避免多个 async handler 并发导致 Go server 通道积压 + 50% 丢弃
+                return;
+            } else if (frameType === 0x01) {
+                // === 批量增量块消息 (v2) ===
+                // 格式: [0x01][block_count:2 BE][block1...][block2...]
+                // 每个 block: [x:2][y:2][w:2][h:2][encoding:1][data_len:2][data...]
+                this.onStats({ type: 'frame', frameType: 0x01, byteLength: 0 });
+                if (totalSize < 3) return;
+                const numBlocks = (buf[1] << 8) | buf[2];
+                if (numBlocks === 0) return;
 
-                const jpegData = buf.slice(offset + MIN_HEADER_SIZE, offset + regionSize);
-                
-                if (frameType === 0x02 || frameType === 0x04) {
-                    hasFullFrame = true;
-                    if(w !== this.offscreenCanvas.width || h !== this.offscreenCanvas.height) {
-                        this.offscreenCanvas.width = w;
-                        this.offscreenCanvas.height = h;
-                        this.canvas.width = w;
-                        this.canvas.height = h;
-                        this.maxFullW = w;
-                        this.maxFullH = h;
-                    }
-                }
-                
-                tasks.push(createImageBitmap(new Blob([jpegData])).then(bitmap => ({bitmap, x, y, w, h, frameType})));
-                offset += regionSize;
-            }
+                // 逐块解析 + 渲染到离屏 canvas
+                let offset = 3;
+                const BLOCK_HEADER = 11; // x(2)+y(2)+w(2)+h(2)+encoding(1)+data_len(2)
+                const jpegBatch = []; // 收集 JPEG 块批量解码
 
-            Promise.all(tasks).then(results => {
-                for (const {bitmap, x, y, w, h, frameType} of results) {
-                    if (frameType === 0x02 || frameType === 0x04) {
-                        this.offscreenCtx.drawImage(bitmap, 0, 0);
+                for (let i = 0; i < numBlocks && offset + BLOCK_HEADER <= totalSize; i++) {
+                    const bx = (buf[offset] << 8) | buf[offset+1];
+                    const by = (buf[offset+2] << 8) | buf[offset+3];
+                    const bw = (buf[offset+4] << 8) | buf[offset+5];
+                    const bh = (buf[offset+6] << 8) | buf[offset+7];
+                    const encoding = buf[offset+8];
+                    const dataLen = (buf[offset+9] << 8) | buf[offset+10];
+                    offset += BLOCK_HEADER;
+                    if (dataLen === 0 || offset + dataLen > totalSize) break;
+
+                    if (encoding === 1) {
+                        // BGRA raw — putImageData 直接渲染
+                        // buf.slice() 复制数据避免引用原始 ArrayBuffer
+                        const rawData = new Uint8Array(buf.slice(offset, offset + dataLen));
+                        const clampedArray = new Uint8ClampedArray(rawData.buffer, rawData.byteOffset, dataLen);
+                        const imageData = new ImageData(clampedArray, bw, bh);
+                        this.offscreenCtx.putImageData(imageData, bx, by);
                     } else {
-                        this.offscreenCtx.drawImage(bitmap, x, y);
-                        this.ctx.drawImage(bitmap, x, y);
+                        // JPEG — 收集后批量解码
+                        jpegBatch.push({ x: bx, y: by, w: bw, h: bh, data: buf.slice(offset, offset + dataLen) });
                     }
+                    offset += dataLen;
+                }
+
+                // JPEG 块分批解码（每批 4 个并发）
+                const batchMySeq = ++this.frameSeq;
+                this._processingVideo = true;
+                const BATCH_SIZE = 4;
+                for (let i = 0; i < jpegBatch.length; i += BATCH_SIZE) {
+                    const batch = jpegBatch.slice(i, i + BATCH_SIZE);
+                    const results = await Promise.all(batch.map(async (b) => {
+                        const bitmap = await createImageBitmap(new Blob([b.data]));
+                        return { bitmap, x: b.x, y: b.y, w: b.w, h: b.h };
+                    }));
+                    if (batchMySeq !== this.frameSeq) {
+                        // 过期帧，释放所有 bitmap
+                        for (const {bitmap} of results) bitmap.close();
+                        break;
+                    }
+                    for (const {bitmap, x, y, w, h} of results) {
+                        this.offscreenCtx.drawImage(bitmap, x, y, w, h);
+                        bitmap.close();
+                    }
+                }
+                if (batchMySeq === this.frameSeq) {
+                    this.renderedFrames++;
+                }
+                this._processingVideo = false;
+                // 通过 rAF 渲染队列拷贝到显示 canvas
+                this.pendingRender = true;
+                if (this.rAFId === null) {
+                    this.rAFId = requestAnimationFrame(() => this._renderLoop());
+                }
+            } else {
+                // === 全帧消息 ===
+                // 格式: [frame_type(1)][x(2)][y(2)][w(2)][h(2)][jpeg_data]
+                const HEADER_SIZE = 9;
+                if (totalSize < HEADER_SIZE) return;
+                const x = (buf[1] << 8) | buf[2];
+                const y = (buf[3] << 8) | buf[4];
+                const w = (buf[5] << 8) | buf[6];
+                const h = (buf[7] << 8) | buf[8];
+                if (w === 0 || h === 0) return;
+                const jpegData = buf.slice(HEADER_SIZE);
+                if (jpegData.length === 0) return;
+
+                if (w !== this.offscreenCanvas.width || h !== this.offscreenCanvas.height) {
+                    this.offscreenCanvas.width = w;
+                    this.offscreenCanvas.height = h;
+                    this.canvas.width = w;
+                    this.canvas.height = h;
+                    this.maxFullW = w;
+                    this.maxFullH = h;
+                }
+
+                try {
+                    const mySeq = ++this.frameSeq;
+                    this._processingVideo = true;
+                    const bitmap = await createImageBitmap(new Blob([jpegData]));
+                    if (mySeq !== this.frameSeq) { bitmap.close(); this._processingVideo = false; return; } // 过期帧，丢弃
+                    this.offscreenCtx.drawImage(bitmap, 0, 0, w, h);
                     bitmap.close();
+                    this.renderedFrames++;
+                    this._processingVideo = false;
+                    // 通过 rAF 渲染队列拷贝到显示 canvas
+                    this.pendingRender = true;
+                    if (this.rAFId === null) {
+                        this.rAFId = requestAnimationFrame(() => this._renderLoop());
+                    }
+                } catch (err) {
+                    console.error("Decode error:", err);
+                    this._processingVideo = false;
                 }
-                if (hasFullFrame) {
-                    this.ctx.drawImage(this.offscreenCanvas, 0, 0);
-                }
-                const cursorMap = ['default','text','pointer','n-resize','e-resize','wait','crosshair','move','ne-resize','se-resize'];
-                this.canvas.style.cursor = cursorType === 255 ? 'none' : (cursorMap[cursorType] || 'default');
-            }).catch(() => {});
+            }
         };
 
         this.ws.onclose = () => {
@@ -258,6 +336,17 @@ class ExhibitionRemoteClient {
         }
     }
 
+    getRenderedFrameCount() {
+        return this.renderedFrames;
+    }
+    getReceivedFrameCount() {
+        return this.receivedFrames;
+    }
+    resetFrameCount() {
+        this.renderedFrames = 0;
+        this.receivedFrames = 0;
+    }
+
     initInputBinding() {
         document.addEventListener('mousemove', this._onMouseMove);
         document.addEventListener('mousedown', this._onMouseDown);
@@ -290,7 +379,29 @@ class ExhibitionRemoteClient {
         }
     }
 
+    _renderLoop() {
+        if (this.pendingRender) {
+            this.pendingRender = false;
+            this.ctx.drawImage(this.offscreenCanvas, 0, 0);
+            // 绘制光标叠加层
+            if (this.cursorX >= 0) {
+                this.ctx.beginPath();
+                this.ctx.arc(this.cursorX, this.cursorY, 4, 0, 2 * Math.PI);
+                this.ctx.fillStyle = 'rgba(255,255,255,0.8)';
+                this.ctx.fill();
+                this.ctx.strokeStyle = 'rgba(0,0,0,0.8)';
+                this.ctx.lineWidth = 1.5;
+                this.ctx.stroke();
+            }
+        }
+        this.rAFId = requestAnimationFrame(() => this._renderLoop());
+    }
+
     destroy() {
+        if (this.rAFId !== null) {
+            cancelAnimationFrame(this.rAFId);
+            this.rAFId = null;
+        }
         if (this.ws) {
             this.ws.close();
             this.ws = null;

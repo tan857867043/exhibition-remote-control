@@ -4,19 +4,25 @@ mod encoder;
 
 use capture::ScreenCapturer;
 use dirty_rect::GridManager;
-use encoder::{build_binary_packet, extract_block_rgba_into, downsample_bgra_2x};
+use encoder::{build_binary_packet, build_batch_packet_v2, extract_block_rgba_into, downsample_bgra_2x};
+use winapi::um::winuser::{GetCursorPos, GetCursor, LoadCursorW};
+use winapi::shared::windef::POINT;
 use enigo::{Enigo, MouseControllable, MouseButton, KeyboardControllable, Key};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use sysinfo::System;
 use tokio_tungstenite::tungstenite::Message;
 use turbojpeg::{Compressor, Image, PixelFormat};
+use xxhash_rust::xxh64::xxh64;
+use tokio::select;
 
-// 全局 CPU 负载（由独立监控任务定期刷新，避免主循环高频 sysinfo 开销）
+// 全局 CPU 负载（由独立监控任务定期刷新，避免每帧 sysinfo 开销）
 static CPU_LOAD: AtomicU32 = AtomicU32::new(0);
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug)]
 struct ControlCmd {
     device_id: String,
@@ -25,6 +31,7 @@ struct ControlCmd {
     y: Option<i32>,
     button: Option<String>,
     key: Option<String>,
+    #[allow(dead_code)]
     key_code: Option<u16>,
 }
 
@@ -126,6 +133,13 @@ impl QualityEngine {
     }
 }
 
+#[derive(PartialEq)]
+enum CaptureMode {
+    Incremental,   // 增量脏矩形模式（<15% 变化）
+    Balanced,      // 平衡模式（15%~25%）
+    VideoFullFrame, // 视频全帧模式（≥25% 连续 3 帧）
+}
+
 fn map_key(key_str: &str) -> Option<Key> {
     match key_str {
         "Enter" => Some(Key::Return),
@@ -165,6 +179,43 @@ fn cpus_avg(sys: &System) -> f32 {
     }
 }
 
+// === Cursor Pseudo-Encoding: 跟踪光标形状变化 ===
+struct CursorShapeTracker {
+    last_handle: isize,
+    h_arrow: isize,
+    h_ibeam: isize,
+    h_hand: isize,
+}
+
+impl CursorShapeTracker {
+    fn new() -> Self {
+        unsafe {
+            Self {
+                last_handle: 0,
+                h_arrow: LoadCursorW(std::ptr::null_mut(), (32512u16 as usize) as *const u16) as isize,
+                h_ibeam: LoadCursorW(std::ptr::null_mut(), (32513u16 as usize) as *const u16) as isize,
+                h_hand: LoadCursorW(std::ptr::null_mut(), (32649u16 as usize) as *const u16) as isize,
+            }
+        }
+    }
+
+    fn check_change(&mut self) -> Option<u8> {
+        unsafe {
+            let h = GetCursor() as isize;
+            if h != self.last_handle {
+                self.last_handle = h;
+                let cursor_type = if h == self.h_arrow { 0 }
+                    else if h == self.h_ibeam { 1 }
+                    else if h == self.h_hand { 2 }
+                    else { 0 };
+                Some(cursor_type)
+            } else {
+                None
+            }
+        }
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     println!("Exhibition Agent starting (industry-grade pipeline)...");
@@ -181,6 +232,9 @@ async fn main() {
     let mut send_history: VecDeque<(std::time::Instant, usize)> = VecDeque::new();
     let mut status_log_timer = std::time::Instant::now();
     let mut first_frame = true;
+    let mut capture_mode = CaptureMode::Incremental;
+    let mut dirty_history: VecDeque<f32> = VecDeque::with_capacity(4);
+    let prev_hash_arc = Arc::new(tokio::sync::Mutex::new(None::<u64>));
 
     // Generate or load Device ID
     let device_id = std::fs::read_to_string(".device_id").unwrap_or_else(|_| {
@@ -204,7 +258,7 @@ async fn main() {
     let mem_gb = (sys.total_memory() as f64 / 1_073_741_824.0).round() as u64;
     
     let mut mac_addr = String::new();
-    let networks = sysinfo::Networks::new_with_sysinfo();
+    let networks = sysinfo::Networks::new_with_refreshed_list();
     for (name, data) in &networks {
         if name != "lo" && !name.starts_with("Loopback") {
             mac_addr = format!("{:?}", data.mac_address());
@@ -222,23 +276,42 @@ async fn main() {
         device_id, host_name_encoded, os_name_encoded, cpu_brand_encoded, mem_gb, mac_encoded);
 
     println!("Connecting to hub at {}", url);
-    let (ws_stream, _) = tokio_tungstenite::connect_async(url).await.expect("Failed to connect");
+
+    // 手动建立 TCP 连接以在握手前设置 NoDelay
+    let tcp = tokio::net::TcpStream::connect("127.0.0.1:38921").await.expect("Failed to connect");
+    let _ = tcp.set_nodelay(true);
+    let (ws_stream, _) = tokio_tungstenite::client_async(url, tcp).await.expect("Failed to connect");
+
     let (mut write, mut read) = ws_stream.split();
 
-    // === 优化1: MPSC 通道解耦网络发送 ===
-    // 容量 8192：防止高频增量块溢出导致画面撕裂
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(8192);
+    // === 三通道 MPSC 解耦网络发送 ===
+    // 文本消息通道（ping/pong/telemetry/exec_result）
+    let (_text_tx, mut text_rx) = tokio::sync::mpsc::channel::<Message>(256);
+    // 增量脏矩形流通道（静态/低动态画面，容量 8192）
+    let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<Message>(8192);
+    // 关键全帧流通道（视频模式、首次连接、大幅跳转，容量 64）
+    let (keyframe_tx, mut keyframe_rx) = tokio::sync::mpsc::channel::<Message>(64);
 
-    // 专用异步发送任务
+    // 专用异步发送任务：同时监听三个通道，关键帧优先
     tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if write.send(msg).await.is_err() {
-                break;
+        loop {
+            select! {
+                biased;
+                Some(msg) = keyframe_rx.recv() => {
+                    if write.send(msg).await.is_err() { break; }
+                }
+                Some(msg) = delta_rx.recv() => {
+                    if write.send(msg).await.is_err() { break; }
+                }
+                Some(msg) = text_rx.recv() => {
+                    if write.send(msg).await.is_err() { break; }
+                }
+                else => break,
             }
         }
     });
 
-    // === 优化3: CPU 监控任务（独立定时器 500ms 刷新，避免每帧 sysinfo 开销）===
+    // === CPU 监控任务（独立定时器 500ms 刷新，避免每帧 sysinfo 开销）===
     tokio::spawn(async move {
         let mut sys = System::new_all();
         loop {
@@ -319,75 +392,122 @@ async fn main() {
         }
     });
 
-    // === 优化2: 预分配可复用 buffer，避免高频 malloc ===
+    // === 预分配可复用 buffer，避免高频 malloc ===
     let mut block_buffer: Vec<u8> = Vec::with_capacity(grid_size * grid_size * 4);
     let mut downsample_buffer: Vec<u8> = Vec::with_capacity(screen_w * screen_h); // (w/2 * h/2 * 4)
 
-    // === 核心优化: 将繁重的 CPU 捕获和压缩剥离到独立的 OS 线程 ===
-    // 这样就不会阻塞 Tokio 的异步网络 I/O（WebSocket 读写可以极速响应）
-    std::thread::spawn(move || {
-        // 主循环：捕获→检测→自适应→编码→非阻塞发送
-        loop {
-            let frame_start = std::time::Instant::now();
+    // === Cursor Pseudo-Encoding: 初始化光标跟踪器 ===
+    let mut cursor_tracker = CursorShapeTracker::new();
 
-            if let Some(frame_data) = capturer.capture_frame() {
-                let (dirty_blocks, change_ratio) = grid_mgr.detect_dirty_blocks(&frame_data);
+    // 主循环：捕获→检测→自适应→编码→非阻塞发送（MPSC try_send 解耦网络 I/O）
+    loop {
+        let frame_start = std::time::Instant::now();
 
-                // === 优化3: 从 AtomicU32 读取节流后的 CPU 负载 ===
-                let cpu_load = CPU_LOAD.load(Ordering::Relaxed) as f32 / 10.0;
+        if let Some(frame_data) = capturer.capture_frame() {
+            // Fast pre-check: skip tile diff on static frames using xxhash
+            let frame_hash = xxh64(&frame_data, 0);
+            let mut ph = prev_hash_arc.lock().await;
+            if *ph == Some(frame_hash) {
+                drop(ph);
+                // 静态帧：跳过编码传输，但保留帧间隔控制（不continue）
+                // 让 frame_start 正确流逝，避免画面变化后出现长时间空白
+            } else {
+            *ph = Some(frame_hash);
+            drop(ph);
 
-                let is_video = !first_frame && change_ratio > 0.50;
-                let _is_static = change_ratio < 0.02;
-                let force_key = quality_engine.need_keyframe();
-                first_frame = false;
+            let (dirty_blocks, change_ratio) = grid_mgr.detect_dirty_blocks(&frame_data);
 
+            // === 从 AtomicU32 读取节流后的 CPU 负载 ===
+            let cpu_load = CPU_LOAD.load(Ordering::Relaxed) as f32 / 10.0;
+
+            // === 画面活跃度检测：滑动窗口判定视频模式 ===
+            if !first_frame {
+                dirty_history.push_back(change_ratio);
+                if dirty_history.len() > 3 {
+                    dirty_history.pop_front();
+                }
+                
+                let video_mode = dirty_history.len() == 3 
+                    && dirty_history.iter().all(|&r| r >= 0.25);
+                let static_mode = change_ratio < 0.15;
+                
+                capture_mode = if video_mode {
+                    CaptureMode::VideoFullFrame
+                } else if static_mode {
+                    CaptureMode::Incremental
+                } else {
+                    CaptureMode::Balanced
+                };
+            }
+            first_frame = false;
+
+            let is_video = capture_mode == CaptureMode::VideoFullFrame;
+            let force_key = quality_engine.need_keyframe();
+
+            if is_video {
+                compressor.set_quality(65);  // 视频模式固定 Q=65
+            } else {
                 compressor.set_quality(quality_engine.quality);
-                compressor.set_subsamp(if is_video { turbojpeg::Subsamp::Sub2x2 } else { turbojpeg::Subsamp::None });
+            }
+            // 视频模式强制 4:2:0 subsamp
+            compressor.set_subsamp(if is_video { turbojpeg::Subsamp::Sub2x2 } else { turbojpeg::Subsamp::None });
 
-                let mut frame_send_bytes = 0usize;
-                let mut encode_total_ms = 0u64;
-                let mut network_dropped = false;
+            let mut frame_send_bytes = 0usize;
+            let mut encode_total_ms = 0u64;
+            let mut network_dropped = false;
 
-                if is_video || force_key || (dirty_blocks.len() as f32) > (grid_mgr.last_hashes.len() as f32 * 0.45) {
-                    // 全帧模式
-                    let encode_start = std::time::Instant::now();
+            // 视频/高变化场景优先发全帧（客户端单张 JPEG 解码比数百块快 10x 以上）
+            // 平衡模式也发全帧 → 避免前端逐个解码百个小块（每个块独立 createImageBitmap）
+            let full_frame_threshold = if is_video { 0.05 } else { 0.20 };
+            let should_full_frame = is_video || force_key || capture_mode == CaptureMode::Balanced
+                || (dirty_blocks.len() as f32) > (grid_mgr.last_hashes.len() as f32 * full_frame_threshold);
+            if should_full_frame {
+                // 全帧模式
+                let encode_start = std::time::Instant::now();
+                
+                let jpeg_result = if is_video {
+                    // 降采样 1/2，大幅降低 CPU 开销
+                    downsample_bgra_2x(&frame_data, screen_w, screen_h, &mut downsample_buffer);
+                    compressor.compress_to_vec(Image {
+                        pixels: &downsample_buffer, 
+                        width: screen_w / 2, 
+                        height: screen_h / 2, 
+                        pitch: (screen_w / 2) * 4, 
+                        format: PixelFormat::BGRA,
+                    })
+                } else {
+                    compressor.compress_to_vec(Image {
+                        pixels: &frame_data, width: screen_w, height: screen_h, pitch: screen_w * 4, format: PixelFormat::BGRA,
+                    })
+                };
+
+                if let Ok(jpeg_bytes) = jpeg_result {
+                    encode_total_ms = encode_start.elapsed().as_millis() as u64;
+                    frame_send_bytes = jpeg_bytes.len();
                     
-                    let jpeg_result = if is_video {
-                        // 降采样 1/2，大幅降低 CPU 开销
-                        downsample_bgra_2x(&frame_data, screen_w, screen_h, &mut downsample_buffer);
-                        compressor.compress_to_vec(Image {
-                            pixels: &downsample_buffer, 
-                            width: screen_w / 2, 
-                            height: screen_h / 2, 
-                            pitch: (screen_w / 2) * 4, 
-                            format: PixelFormat::BGRA,
-                        })
-                    } else {
-                        compressor.compress_to_vec(Image {
-                            pixels: &frame_data, width: screen_w, height: screen_h, pitch: screen_w * 4, format: PixelFormat::BGRA,
-                        })
-                    };
-
-                    if let Ok(jpeg_bytes) = jpeg_result {
-                        encode_total_ms = encode_start.elapsed().as_millis() as u64;
-                        frame_send_bytes = jpeg_bytes.len();
-                        
-                        // flag 0x03 means 1/2 scaled full frame, 0x02 means full frame
-                        let frame_flag = if is_video { 0x03 } else { 0x02 };
-                        
-                        // 优化1: 非阻塞 try_send，通道满则丢弃
-                        if tx.try_send(Message::Binary(
-                            build_binary_packet(frame_flag, 0, 0, screen_w as u16, screen_h as u16, &jpeg_bytes)
-                        )).is_err() {
-                            network_dropped = true;
-                        }
+                    // flag 0x03 means 1/2 scaled full frame, 0x02 means full frame
+                    let frame_flag = if is_video { 0x03 } else { 0x02 };
+                    
+                    // 非阻塞 try_send，通道满则丢弃
+                    if keyframe_tx.try_send(Message::Binary(
+                        build_binary_packet(frame_flag, 0, 0, screen_w as u16, screen_h as u16, &jpeg_bytes)
+                    )).is_err() {
+                        network_dropped = true;
                     }
-                } else if !dirty_blocks.is_empty() {
-                    // 增量模式：连通分量包围盒合并（参照 VNC/X11 Damage 做法）
-                    let merged = grid_mgr.merge_connected_components(&dirty_blocks);
-                    for block in &merged {
-                        // 优化2: 复用 block_buffer，clear + 原地覆写
-                        extract_block_rgba_into(&frame_data, block, screen_w, &mut block_buffer);
+                }
+            } else if !dirty_blocks.is_empty() {
+                // 增量模式：连通分量包围盒合并 + 批量消息（一次编码+发送，避免数百条独立消息）
+                let merged = grid_mgr.merge_connected_components(&dirty_blocks);
+                let mut batch_blocks_v2: Vec<(u16, u16, u16, u16, u8, Vec<u8>)> = Vec::with_capacity(merged.len());
+                for block in &merged {
+                    extract_block_rgba_into(&frame_data, block, screen_w, &mut block_buffer);
+                    let area = block.w as u32 * block.h as u32;
+                    if area < 128 * 128 {
+                        // 小块：使用原始 BGRA（避免 JPEG 编解码开销）
+                        frame_send_bytes += block_buffer.len();
+                        batch_blocks_v2.push((block.x, block.y, block.w, block.h, 1, block_buffer.clone()));
+                    } else {
+                        // 大块：继续使用 JPEG 编码
                         let encode_start = std::time::Instant::now();
                         if let Ok(jpeg_bytes) = compressor.compress_to_vec(Image {
                             pixels: &block_buffer,
@@ -398,49 +518,74 @@ async fn main() {
                         }) {
                             encode_total_ms += encode_start.elapsed().as_millis() as u64;
                             frame_send_bytes += jpeg_bytes.len();
-
-                            // 优化1: 非阻塞发送
-                            if tx.try_send(Message::Binary(
-                                build_binary_packet(0x01, block.x, block.y, block.w, block.h, &jpeg_bytes)
-                            )).is_err() {
-                                network_dropped = true;
-                                break;
-                            }
+                            batch_blocks_v2.push((block.x, block.y, block.w, block.h, 0, jpeg_bytes));
                         }
                     }
                 }
-
-                if network_dropped {
-                    grid_mgr.last_hashes.fill(0);
-                }
-
-                // 带宽统计
-                let now = std::time::Instant::now();
-                send_history.push_back((now, frame_send_bytes));
-                while send_history.front().map_or(false, |(t, _)| now.duration_since(*t).as_millis() > 1000) {
-                    send_history.pop_front();
-                }
-                let send_kbps = send_history.iter().map(|(_, b)| b).sum::<usize>() as f32 / 1024.0;
-                quality_engine.adapt(change_ratio, cpu_load, encode_total_ms, send_kbps);
-
-                if status_log_timer.elapsed().as_secs() >= 5 {
-                    quality_engine.log_status();
-                    println!("  CPU={:.0}% change={:.1}% blocks={} send={:.0}KB/s",
-                        cpu_load, change_ratio * 100.0, dirty_blocks.len(), send_kbps);
-                    status_log_timer = std::time::Instant::now();
+                if !batch_blocks_v2.is_empty() {
+                    // 转为切片引用构建批量包 v2
+                    let refs: Vec<(u16, u16, u16, u16, u8, &[u8])> = batch_blocks_v2.iter()
+                        .map(|(x, y, w, h, enc, data)| (*x, *y, *w, *h, *enc, data.as_slice()))
+                        .collect();
+                    if delta_tx.try_send(Message::Binary(build_batch_packet_v2(&refs))).is_err() {
+                        network_dropped = true;
+                    }
                 }
             }
 
-            let elapsed_ms = frame_start.elapsed().as_millis() as u64;
-            let target_ms = 1000 / quality_engine.framerate;
-            if elapsed_ms < target_ms {
-                // 因为在独立线程中，这里用标准的 std::thread::sleep 即可
-                std::thread::sleep(std::time::Duration::from_millis(target_ms - elapsed_ms));
+            if network_dropped || capture_mode == CaptureMode::VideoFullFrame {
+                grid_mgr.last_hashes.fill(0);
             }
+
+            // === Cursor Pseudo-Encoding: 发送光标位置和形状变化 ===
+            unsafe {
+                let mut pt: POINT = std::mem::zeroed();
+                if GetCursorPos(&mut pt) != 0 {
+                    // 光标位置消息 (0x07): 每帧发送
+                    let mut cursor_msg = Vec::with_capacity(5);
+                    cursor_msg.push(0x07);
+                    cursor_msg.extend_from_slice(&(pt.x as u16).to_be_bytes());
+                    cursor_msg.extend_from_slice(&(pt.y as u16).to_be_bytes());
+                    let _ = delta_tx.try_send(Message::Binary(cursor_msg));
+
+                    // 光标形状变化消息 (0x08): 仅在类型变化时发送
+                    if let Some(cursor_type) = cursor_tracker.check_change() {
+                        let mut shape_msg = Vec::with_capacity(4);
+                        shape_msg.push(0x08);
+                        shape_msg.push(cursor_type);
+                        shape_msg.extend_from_slice(&0u16.to_be_bytes()); // png_len=0, 客户端根据类型使用系统光标
+                        let _ = delta_tx.try_send(Message::Binary(shape_msg));
+                    }
+                }
+            }
+
+            // 带宽统计
+            let now = std::time::Instant::now();
+            send_history.push_back((now, frame_send_bytes));
+            while send_history.front().map_or(false, |(t, _)| now.duration_since(*t).as_millis() > 1000) {
+                send_history.pop_front();
+            }
+            let send_kbps = send_history.iter().map(|(_, b)| b).sum::<usize>() as f32 / 1024.0;
+            quality_engine.adapt(change_ratio, cpu_load, encode_total_ms, send_kbps);
+
+            if status_log_timer.elapsed().as_secs() >= 5 {
+                quality_engine.log_status();
+                println!("  CPU={:.0}% change={:.1}% blocks={} send={:.0}KB/s",
+                    cpu_load, change_ratio * 100.0, dirty_blocks.len(), send_kbps);
+                status_log_timer = std::time::Instant::now();
+            }
+            } // closes else (xxhash not match → encode)
         }
-    });
 
-    // 阻塞主线程，保持 Tokio 运行时存活
-    tokio::signal::ctrl_c().await.unwrap();
-    println!("Agent shutting down...");
+        // 固定帧间隔：消除帧间隔抖动
+        let target_interval_ms = match capture_mode {
+            CaptureMode::VideoFullFrame => 30,   // ~33 FPS
+            CaptureMode::Balanced => 30,          // ~33 FPS
+            CaptureMode::Incremental => 40,       // 25 FPS
+        };
+        let elapsed_ms = frame_start.elapsed().as_millis() as u64;
+        if elapsed_ms < target_interval_ms {
+            tokio::time::sleep(std::time::Duration::from_millis(target_interval_ms - elapsed_ms)).await;
+        }
+    }
 }

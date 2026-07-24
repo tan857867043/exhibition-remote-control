@@ -20,6 +20,7 @@ export default function App() {
   const [viewMode, setViewMode] = useState<"devices" | "remote">("devices");
   
   const [fps, setFps] = useState(0);
+  const [recvFps, setRecvFps] = useState(0);
   const [dataRate, setDataRate] = useState(0);
   const [blockCount, setBlockCount] = useState(0);
   const [resolution, setResolution] = useState("--");
@@ -133,19 +134,28 @@ export default function App() {
     if (viewMode !== 'remote') return;
 
     const fpsTimer = setInterval(() => {
-      setFps(fpsCounterRef.current);
+      if (clientRef.current && clientRef.current.getRenderedFrameCount) {
+        const rendered = clientRef.current.getRenderedFrameCount();
+        const received = clientRef.current.getReceivedFrameCount();
+        setFps(Math.round(rendered / 2));
+        setRecvFps(Math.round(received / 2));
+        clientRef.current.resetFrameCount();
+      } else {
+        setFps(fpsCounterRef.current);
+        setRecvFps(fpsCounterRef.current);
+      }
       fpsCounterRef.current = 0;
-    }, 1000);
+    }, 2000);
 
     const dataRateTimer = setInterval(() => {
       setDataRate(Math.round(bytesReceivedRef.current / 1024));
       bytesReceivedRef.current = 0;
-    }, 1000);
+    }, 2000);
 
     const blockTimer = setInterval(() => {
       setBlockCount(blockCounterRef.current);
       blockCounterRef.current = 0;
-    }, 1000);
+    }, 2000);
 
     const resTimer = setInterval(() => {
       if (clientRef.current && clientRef.current.maxFullW > 0) {
@@ -360,8 +370,11 @@ export default function App() {
                             alt="Screen Thumbnail"
                             className="w-full h-full object-cover opacity-70 group-hover:opacity-100 transition-opacity"
                             onError={(e) => {
-                              (e.target as HTMLImageElement).style.display = 'none';
-                              (e.target as HTMLImageElement).parentElement!.innerHTML = '<div class="text-slate-700 flex flex-col items-center"><svg class="w-6 h-6 mb-1" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg><span class="text-[10px]">无缩略图</span></div>';
+                              const img = e.target as HTMLImageElement;
+                              if (img.parentElement) {
+                                img.style.display = 'none';
+                                img.parentElement.innerHTML = '<div class="text-slate-700 flex flex-col items-center"><svg class="w-6 h-6 mb-1" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg><span class="text-[10px]">无缩略图</span></div>';
+                              }
                             }}
                           />
                           <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 bg-indigo-900/40 transition-opacity">
@@ -436,8 +449,12 @@ export default function App() {
             <div className="flex items-center gap-4">
               <div className="flex gap-4 text-xs font-mono text-slate-400 mr-2">
                 <div className="flex flex-col items-end">
-                  <span className="text-[9px] uppercase">FPS</span>
+                  <span className="text-[9px] uppercase">显示</span>
                   <span className={fps > 20 ? "text-emerald-400 font-bold" : "text-amber-400 font-bold"}>{fps}</span>
+                </div>
+                <div className="flex flex-col items-end">
+                  <span className="text-[9px] uppercase">接收</span>
+                  <span className={recvFps > 20 ? "text-sky-400 font-bold" : "text-amber-400 font-bold"}>{recvFps}</span>
                 </div>
                 <div className="flex flex-col items-end">
                   <span className="text-[9px] uppercase">KB/s</span>
