@@ -2,13 +2,8 @@ package hub
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
-	"net"
 	"net/http"
-	"os"
-	"strconv"
-	"strings"
 
 	"github.com/gorilla/websocket"
 )
@@ -37,7 +32,6 @@ func InitRouter() {
 	// 2. 面向第三方系统的开放 API 接口
 	http.HandleFunc("/api/v1/devices", corsMiddleware(handleListDevices))
 	http.HandleFunc("/api/v1/devices/thumbnail", corsMiddleware(handleThumbnail))
-	http.HandleFunc("/api/v1/agent/download", corsMiddleware(handleAgentDownload))
 	http.HandleFunc("/api/v1/stream", handleStreamSubscribe)
 	http.HandleFunc("/api/v1/control", corsMiddleware(handleExternalControl))
 }
@@ -54,11 +48,8 @@ func handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 	deviceOS := r.URL.Query().Get("os")
 	deviceCPU := r.URL.Query().Get("cpu")
 	deviceRAM := r.URL.Query().Get("ram")
-	deviceMAC := cleanMAC(r.URL.Query().Get("mac"))
-	deviceIP, _, _ := net.SplitHostPort(r.RemoteAddr)
-	if deviceIP == "" {
-		deviceIP = r.RemoteAddr
-	}
+	deviceMAC := r.URL.Query().Get("mac")
+	deviceIP := r.RemoteAddr
 	if deviceID == "" {
 		conn.Close()
 		return
@@ -93,11 +84,11 @@ func handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if messageType == websocket.BinaryMessage {
-			if len(payload) > 9 && payload[0] == 0x02 { // 0x02 indicates full frame
+			if len(payload) > 14 && (payload[0] == 0x02 || payload[0] == 0x04) { // 0x02 or 0x04 indicates full frame
 				GlobalHub.mu.Lock()
-				// Extract JPEG bytes (skip 9 bytes header)
-				jpegBytes := make([]byte, len(payload)-9)
-				copy(jpegBytes, payload[9:])
+				// Extract JPEG bytes (skip 14 bytes header)
+				jpegBytes := make([]byte, len(payload)-14)
+				copy(jpegBytes, payload[14:])
 				GlobalHub.LatestFrame[deviceID] = jpegBytes
 				GlobalHub.mu.Unlock()
 			}
@@ -235,110 +226,4 @@ func handleStreamSubscribe(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-}
-
-func handleAgentDownload(w http.ResponseWriter, r *http.Request) {
-	data, err := os.ReadFile("static/exhibition-agent.exe")
-	if err != nil {
-		http.Error(w, "failed to read agent binary: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	lanIP := detectLANIP()
-	if lanIP == "" {
-		http.Error(w, "failed to detect LAN IP", http.StatusInternalServerError)
-		return
-	}
-
-	serverURL := fmt.Sprintf("ws://%s:38921", lanIP)
-	// 在 exe 尾部追加配置块（PE 加载器忽略尾部数据）
-	tail := fmt.Sprintf("\n---EXHIBITION_CONF---\nserver=%s\n", serverURL)
-
-	modified := make([]byte, len(data)+len(tail))
-	copy(modified, data)
-	copy(modified[len(data):], tail)
-
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Disposition", `attachment; filename="exhibition-agent.exe"`)
-	w.Write(modified)
-}
-
-func detectLANIP() string {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return ""
-	}
-
-	var fallbackIP string
-	var ip192, ip10, ip172 string
-
-	for _, iface := range ifaces {
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-		for _, addr := range addrs {
-			ipNet, ok := addr.(*net.IPNet)
-			if !ok {
-				continue
-			}
-			ip := ipNet.IP
-			if ip.IsLoopback() {
-				continue
-			}
-			ip4 := ip.To4()
-			if ip4 == nil {
-				continue
-			}
-			ipStr := ip4.String()
-
-			if fallbackIP == "" {
-				fallbackIP = ipStr
-			}
-
-			if len(ipStr) >= 8 && ipStr[:8] == "192.168." {
-				ip192 = ipStr
-			} else if ipStr[:3] == "10." {
-				ip10 = ipStr
-			} else if len(ipStr) >= 4 && ipStr[:4] == "172." {
-				ip172 = ipStr
-			}
-		}
-	}
-
-	// 优先级: 192.168 > 10. > 172. > 任意
-	if ip192 != "" {
-		return ip192
-	}
-	if ip10 != "" {
-		return ip10
-	}
-	if ip172 != "" {
-		return ip172
-	}
-	return fallbackIP
-}
-
-// cleanMAC converts Rust debug format MacAddr([216, 94, ...]) to D8:5E:D3:A3:17:62
-func cleanMAC(raw string) string {
-	// Remove "MacAddr([" prefix and "])" suffix
-	inner := strings.TrimPrefix(raw, "MacAddr([")
-	inner = strings.TrimSuffix(inner, "])")
-	if inner == raw {
-		return raw // not Rust debug format, return as-is
-	}
-	parts := strings.Split(inner, ",")
-	if len(parts) != 6 {
-		return raw
-	}
-	var out [6]byte
-	for i, p := range parts {
-		v, err := strconv.Atoi(strings.TrimSpace(p))
-		if err != nil {
-			return raw
-		}
-		out[i] = byte(v)
-	}
-	return fmt.Sprintf("%02X:%02X:%02X:%02X:%02X:%02X",
-		out[0], out[1], out[2], out[3], out[4], out[5])
 }

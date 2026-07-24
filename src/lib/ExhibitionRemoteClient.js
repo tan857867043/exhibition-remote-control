@@ -1,272 +1,276 @@
+// ============ VK Code Mapping (e.code → Windows VK) ============
+const CODE_TO_VK = {
+    // Letters
+    KeyA:0x41,KeyB:0x42,KeyC:0x43,KeyD:0x44,KeyE:0x45,KeyF:0x46,KeyG:0x47,KeyH:0x48,
+    KeyI:0x49,KeyJ:0x4A,KeyK:0x4B,KeyL:0x4C,KeyM:0x4D,KeyN:0x4E,KeyO:0x4F,KeyP:0x50,
+    KeyQ:0x51,KeyR:0x52,KeyS:0x53,KeyT:0x54,KeyU:0x55,KeyV:0x56,KeyW:0x57,KeyX:0x58,
+    KeyY:0x59,KeyZ:0x5A,
+    // Numbers
+    Digit0:0x30,Digit1:0x31,Digit2:0x32,Digit3:0x33,Digit4:0x34,
+    Digit5:0x35,Digit6:0x36,Digit7:0x37,Digit8:0x38,Digit9:0x39,
+    // Numpad
+    Numpad0:0x60,Numpad1:0x61,Numpad2:0x62,Numpad3:0x63,Numpad4:0x64,
+    Numpad5:0x65,Numpad6:0x66,Numpad7:0x67,Numpad8:0x68,Numpad9:0x69,
+    NumpadMultiply:0x6A,NumpadAdd:0x6B,NumpadSubtract:0x6D,NumpadDecimal:0x6E,NumpadDivide:0x6F,
+    // Function keys
+    F1:0x70,F2:0x71,F3:0x72,F4:0x73,F5:0x74,F6:0x75,
+    F7:0x76,F8:0x77,F9:0x78,F10:0x79,F11:0x7A,F12:0x7B,
+    // Navigation
+    ArrowUp:0x26,ArrowDown:0x28,ArrowLeft:0x25,ArrowRight:0x27,
+    Home:0x24,End:0x23,PageUp:0x21,PageDown:0x22,Insert:0x2D,Delete:0x2E,
+    // Modifiers
+    ShiftLeft:0xA0,ShiftRight:0xA1,ControlLeft:0xA2,ControlRight:0xA3,
+    AltLeft:0xA4,AltRight:0xA5,MetaLeft:0x5B,MetaRight:0x5C,
+    // Special
+    Space:0x20,Enter:0x0D,Tab:0x09,Escape:0x1B,Backspace:0x08,
+    CapsLock:0x14,NumLock:0x90,ScrollLock:0x91,PrintScreen:0x2C,Pause:0x13,
+    // Symbols
+    Minus:0xBD,Equal:0xBB,BracketLeft:0xDB,BracketRight:0xDD,Backslash:0xDC,
+    Semicolon:0xBA,Quote:0xDE,Comma:0xBC,Period:0xBE,Slash:0xBF,Backquote:0xC0,
+    // Numpad Enter
+    NumpadEnter:0x0D,
+};
+const MODIFIER_CODES = new Set(['ShiftLeft','ShiftRight','ControlLeft','ControlRight','AltLeft','AltRight','MetaLeft','MetaRight']);
+
+function getVk(e){
+    if(CODE_TO_VK[e.code]!==undefined)return CODE_TO_VK[e.code];
+    return e.keyCode||e.which||0;
+}
+
 class ExhibitionRemoteClient {
-    constructor(canvasElement, serverUrl, targetDeviceId, onStats) {
-        this.canvas = canvasElement;
-        this.ctx = this.canvas.getContext('2d');
+    constructor(canvas, serverUrl, deviceId, onStats) {
+        this.canvas = canvas;
+        this.ctx = canvas.getContext('2d', { alpha: false });
         this.serverUrl = serverUrl;
-        this.deviceId = targetDeviceId;
-        this.onStats = onStats || (() => {});
-        this.frameSeq = 0;
-        this.lastRendered = 0;
-        this.srcW = 0;
-        this.srcH = 0;
+        this.deviceId = deviceId;
+        this.onStats = onStats;
 
-        this.canvas.width = 1920;
-        this.canvas.height = 1080;
+        this.offscreenCanvas = document.createElement('canvas');
+        this.offscreenCtx = this.offscreenCanvas.getContext('2d', { alpha: false });
 
-        // 全帧分辨率追踪（用于增量块坐标缩放）
-        // 初始值用 canvas 默认尺寸，确保即使首帧降采样也能正确计算 scale
         this.maxFullW = this.canvas.width;
         this.maxFullH = this.canvas.height;
 
-        // Debug 开关：设为 true 可在画面上看到增量块的红色边框
-        this.debugOverlay = true;
-
-        // 输入状态
         this.mouseDown = false;
         this.lastMouseMoveTime = 0;
-        this.mouseMoveThrottle = 30; // ms
-        this.keyboardCaptured = false;   // 是否在捕获键盘模式
-        this.modifiers = { ctrl: false, alt: false, shift: false, meta: false };
+        this.keyboardCaptured = false;
+        this.pressedKeys = {};
+        this.keyBatch = [];
+        this.keyBatchTimer = null;
 
-        this.initWebSocket();
+        this._onMouseMove = (e) => this.sendMouseEvent(e);
+        this._onMouseDown = (e) => this.sendMouseEvent(e);
+        this._onMouseUp = (e) => this.sendMouseEvent(e);
+        this._onWheel = (e) => this.sendMouseEvent(e);
+        this._onKeyDown = (e) => this.sendKeyboardEvent(e);
+        this._onKeyUp = (e) => this.sendKeyboardEvent(e);
+        this._onContextMenu = (e) => {
+            if (this.keyboardCaptured) e.preventDefault();
+        };
+
+        this.initConnection();
         this.initInputBinding();
     }
 
-    // ---- WebSocket ----
-    initWebSocket() {
-        const wsUrl = this.serverUrl.replace(/^http/, 'ws');
-        this.ws = new WebSocket(`${wsUrl}/api/v1/stream?device_id=${this.deviceId}`);
+    initConnection() {
+        const wsProtocol = this.serverUrl.startsWith('https') ? 'wss' : 'ws';
+        const host = this.serverUrl.replace(/^https?:\/\//, '');
+        const wsUrl = `${wsProtocol}://${host}/api/v1/stream?device_id=${this.deviceId}`;
+        
+        this.ws = new WebSocket(wsUrl);
         this.ws.binaryType = 'arraybuffer';
-        this.pendingTasks = [];
-        this.processing = false;
 
-        this.ws.onmessage = (event) => {
-            const buffer = event.data;
-            const view = new DataView(buffer);
-            const frameType = view.getUint8(0);
-            const x = view.getUint16(1);
-            const y = view.getUint16(3);
-            const w = view.getUint16(5);
-            const h = view.getUint16(7);
-            const cursorId = buffer.byteLength > 9 ? view.getUint8(9) : 0;
-
-            const jpegData = new Uint8Array(buffer, 10);
-
-            // 映射光标类型到 CSS cursor
-            const cursorMap = ['default', 'text', 'pointer', 'ns-resize', 'ew-resize', 'wait', 'crosshair', 'move', 'nesw-resize', 'nwse-resize'];
-            this.canvas.style.cursor = cursorMap[cursorId] || 'default';
-
-            // 反馈统计
-            this.onStats({ type: 'frame', frameType, byteLength: buffer.byteLength });
-
-            const task = {
-                frameType, x, y, w, h,
-                bitmapPromise: createImageBitmap(new Blob([jpegData], { type: 'image/jpeg' }))
-            };
-            this.pendingTasks.push(task);
-            this.processTasks();
+        this.ws.onopen = () => {
+            console.log("Connected to device stream");
+            // Set default quality immediately
+            this.setQuality(50);
         };
-    }
 
-    async processTasks() {
-        if (this.processing) return;
-        this.processing = true;
+        this.ws.onmessage = async (e) => {
+            if (typeof e.data === 'string') return;
+            const buf = new Uint8Array(e.data);
+            this.onStats({ type: 'frame', byteLength: buf.length });
 
-        while (this.pendingTasks.length > 0) {
-            const task = this.pendingTasks.shift();
-            try {
-                const bitmap = await task.bitmapPromise;
+            const MIN_HEADER_SIZE = 14;
+            let offset = 0;
+            const tasks = [];
+            let hasFullFrame = false;
+            let cursorType = 0;
+            const totalSize = buf.length;
+
+            while(offset + MIN_HEADER_SIZE <= totalSize) {
+                const frameType = buf[offset];
+                const x = (buf[offset+1] << 8) | buf[offset+2];
+                const y = (buf[offset+3] << 8) | buf[offset+4];
+                const w = (buf[offset+5] << 8) | buf[offset+6];
+                const h = (buf[offset+7] << 8) | buf[offset+8];
+                const jpegLen = (buf[offset+9] << 24) | (buf[offset+10] << 16) | (buf[offset+11] << 8) | buf[offset+12];
+                cursorType = buf[offset+13];
                 
-                if (task.frameType === 0x02) {
-                    // 全帧：记录最大分辨率（即原始屏幕分辨率）
-                    if (task.w > this.maxFullW) this.maxFullW = task.w;
-                    if (task.h > this.maxFullH) this.maxFullH = task.h;
+                if (frameType === 0x01) {
+                    this.onStats({ type: 'frame', frameType: 0x01, byteLength: 0 });
+                }
 
-                    this.canvas.width = task.w;
-                    this.canvas.height = task.h;
-                    this.ctx.drawImage(bitmap, 0, 0, task.w, task.h);
-                } else {
-                    // 增量块
-                    const scaleX = this.maxFullW > 0 ? this.canvas.width / this.maxFullW : 1;
-                    const scaleY = this.maxFullH > 0 ? this.canvas.height / this.maxFullH : 1;
-                    const dx = Math.round(task.x * scaleX);
-                    const dy = Math.round(task.y * scaleY);
-                    const dw = Math.max(1, Math.round(task.w * scaleX));
-                    const dh = Math.max(1, Math.round(task.h * scaleY));
+                const regionSize = MIN_HEADER_SIZE + jpegLen;
+                if(offset + regionSize > totalSize) break;
+                
+                if(w === 0 || h === 0 || jpegLen === 0){
+                    offset += regionSize;
+                    continue;
+                }
 
-                    this.ctx.drawImage(bitmap, dx, dy, dw, dh);
-
-                    // Debug: 红色矩形框标记增量块位置
-                    if (this.debugOverlay) {
-                        this.ctx.strokeStyle = 'rgba(255, 0, 0, 0.6)';
-                        this.ctx.lineWidth = 1;
-                        this.ctx.strokeRect(dx + 0.5, dy + 0.5, dw - 1, dh - 1);
+                const jpegData = buf.slice(offset + MIN_HEADER_SIZE, offset + regionSize);
+                
+                if (frameType === 0x02 || frameType === 0x04) {
+                    hasFullFrame = true;
+                    if(w !== this.offscreenCanvas.width || h !== this.offscreenCanvas.height) {
+                        this.offscreenCanvas.width = w;
+                        this.offscreenCanvas.height = h;
+                        this.canvas.width = w;
+                        this.canvas.height = h;
+                        this.maxFullW = w;
+                        this.maxFullH = h;
                     }
                 }
-                bitmap.close();
-            } catch (err) {
-                console.error("Bitmap decode error:", err);
+                
+                tasks.push(createImageBitmap(new Blob([jpegData])).then(bitmap => ({bitmap, x, y, w, h, frameType})));
+                offset += regionSize;
             }
-        }
-        
-        this.processing = false;
-    }
 
-    // ---- 坐标换算 (处理 object-contain 黑边) ----
-    screenToRemote(clientX, clientY) {
-        const rect = this.canvas.getBoundingClientRect();
-        const remoteW = this.maxFullW || this.canvas.width;
-        const remoteH = this.maxFullH || this.canvas.height;
+            Promise.all(tasks).then(results => {
+                for (const {bitmap, x, y, w, h, frameType} of results) {
+                    if (frameType === 0x02 || frameType === 0x04) {
+                        this.offscreenCtx.drawImage(bitmap, 0, 0);
+                    } else {
+                        this.offscreenCtx.drawImage(bitmap, x, y);
+                        this.ctx.drawImage(bitmap, x, y);
+                    }
+                    bitmap.close();
+                }
+                if (hasFullFrame) {
+                    this.ctx.drawImage(this.offscreenCanvas, 0, 0);
+                }
+                const cursorMap = ['default','text','pointer','n-resize','e-resize','wait','crosshair','move','ne-resize','se-resize'];
+                this.canvas.style.cursor = cursorType === 255 ? 'none' : (cursorMap[cursorType] || 'default');
+            }).catch(() => {});
+        };
 
-        // 计算 object-contain 实际显示区域（会有 letterbox 黑边）
-        const canvasAspect = rect.width / rect.height;
-        const remoteAspect = remoteW / remoteH;
-        let drawW, drawH, offsetX, offsetY;
-        if (canvasAspect > remoteAspect) {
-            // canvas 更宽 → 左右黑边
-            drawH = rect.height;
-            drawW = drawH * remoteAspect;
-            offsetX = (rect.width - drawW) / 2;
-            offsetY = 0;
-        } else {
-            // canvas 更高 → 上下黑边
-            drawW = rect.width;
-            drawH = drawW / remoteAspect;
-            offsetX = 0;
-            offsetY = (rect.height - drawH) / 2;
-        }
-
-        return {
-            x: Math.round(((clientX - rect.left - offsetX) / drawW) * remoteW),
-            y: Math.round(((clientY - rect.top - offsetY) / drawH) * remoteH)
+        this.ws.onclose = () => {
+            console.log("Disconnected from device stream");
         };
     }
 
-    // ---- 发送控制命令 ----
-    sendControl(action, extra = {}) {
-        const payload = JSON.stringify({
-            device_id: this.deviceId,
-            action: action,
-            ...extra
-        });
+    sendMouseEvent(e) {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+        if (!this.keyboardCaptured && e.type !== 'mousedown') return;
 
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-            this.ws.send(payload);
+        if (e.type === 'mousedown') {
+            this.captureKeyboard();
+        }
+
+        const r = this.canvas.getBoundingClientRect();
+        const scale = Math.min(r.width / this.canvas.width, r.height / this.canvas.height);
+        const imgW = this.canvas.width * scale;
+        const imgH = this.canvas.height * scale;
+        const offsetX = (r.width - imgW) / 2;
+        const offsetY = (r.height - imgH) / 2;
+        const rx = e.clientX - r.left - offsetX;
+        const ry = e.clientY - r.top - offsetY;
+        
+        if (rx < 0 || ry < 0 || rx > imgW || ry > imgH) return;
+        
+        const x = Math.round(rx / scale);
+        const y = Math.round(ry / scale);
+        const btn = e.button; 
+        
+        let buf;
+        if (e.type === 'mousemove') {
+            const now = Date.now();
+            if (now - this.lastMouseMoveTime < 16) return;
+            this.lastMouseMoveTime = now;
+            buf = new Uint8Array([0x01, btn, x & 0xFF, (x >> 8) & 0xFF, y & 0xFF, (y >> 8) & 0xFF]);
+        } else if (e.type === 'mousedown') {
+            buf = new Uint8Array([0x02, btn, 1, 0, 0, 0]);
+        } else if (e.type === 'mouseup') {
+            buf = new Uint8Array([0x02, btn, 0, 0, 0, 0]);
+        } else if (e.type === 'wheel') {
+            e.preventDefault();
+            const d = Math.round(e.deltaY);
+            buf = new Uint8Array([0x03, 0, d & 0xFF, (d >> 8) & 0xFF, 0, 0]);
         } else {
-            // 回退到 HTTP 或静默
-            fetch(`${this.serverUrl}/api/v1/control`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: payload
-            }).catch(() => {});
+            return;
+        }
+        
+        this.ws.send(buf.buffer);
+    }
+
+    sendKeyboardEvent(e) {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+        const vk = getVk(e);
+        if (!vk) return;
+
+        if (e.type === 'keydown' && e.ctrlKey && e.altKey && vk === 0x2E) {
+            e.preventDefault();
+            this.ws.send(new Uint8Array([0x05, 10, 0, 0, 0, 0]).buffer);
+            return;
+        }
+
+        if (!this.keyboardCaptured) return;
+
+        if (e.type === 'keydown') {
+            this.pressedKeys[e.code] = vk;
+            if (e.repeat) return;
+            e.preventDefault();
+        } else if (e.type === 'keyup') {
+            delete this.pressedKeys[e.code];
+            e.preventDefault();
+        } else {
+            return;
+        }
+
+        if (MODIFIER_CODES.has(e.code)) {
+            const action = e.type === 'keydown' ? 0 : 1;
+            const buf = new Uint8Array([0x04, 1, action, vk & 0xFF, (vk >> 8) & 0xFF, 0, 0]);
+            this.ws.send(buf.buffer);
+            return;
+        }
+
+        const action = e.type === 'keydown' ? 0 : 1;
+        this.keyBatch.push(action, vk & 0xFF, (vk >> 8) & 0xFF);
+        
+        if (!this.keyBatchTimer) {
+            this.keyBatchTimer = setTimeout(() => {
+                this.keyBatchTimer = null;
+                if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+                const buf = new Uint8Array(2 + this.keyBatch.length);
+                buf[0] = 0x04;
+                buf[1] = this.keyBatch.length / 3;
+                for (let i = 0; i < this.keyBatch.length; i++) buf[2 + i] = this.keyBatch[i];
+                this.ws.send(buf.buffer);
+                this.keyBatch = [];
+            }, 2);
         }
     }
 
-    // ---- 输入绑定 ----
-    initInputBinding() {
-        // === 鼠标事件 ===
-        // mousedown → 远程 mouse_down
-        this.canvas.addEventListener('mousedown', (e) => {
-            e.preventDefault();
-            const { x, y } = this.screenToRemote(e.clientX, e.clientY);
-            const btn = e.button === 2 ? 'right' : e.button === 1 ? 'middle' : 'left';
-            this.mouseDown = true;
-            this.sendControl('mouse_move', { x, y });
-            this.sendControl('mouse_down', { button: btn });
-            // 激活键盘捕获
-            this.captureKeyboard();
-        });
-
-        // mouseup → 远程 mouse_up
-        this.canvas.addEventListener('mouseup', (e) => {
-            e.preventDefault();
-            const btn = e.button === 2 ? 'right' : e.button === 1 ? 'middle' : 'left';
-            this.mouseDown = false;
-            this.sendControl('mouse_up', { button: btn });
-        });
-
-        // mousemove → 远程 mouse_move（拖拽时或频率限制）
-        this.mouseMoveThrottle = 16; // 60fps 对应的节流
-        this.canvas.addEventListener('mousemove', (e) => {
-            if (!this.mouseDown) return;
-            const now = Date.now();
-            if (now - this.lastMouseMoveTime < this.mouseMoveThrottle) return;
-            this.lastMouseMoveTime = now;
-            const { x, y } = this.screenToRemote(e.clientX, e.clientY);
-            this.sendControl('mouse_move', { x, y });
-        });
-
-        // 滚轮
-        this.canvas.addEventListener('wheel', (e) => {
-            e.preventDefault();
-            // deltaY > 0 向下滚，取反后符合 enigo：正=向上
-            const delta = Math.round(-e.deltaY / 40); // 转为行数
-            this.sendControl('mouse_wheel', { y: delta });
-        }, { passive: false });
-
-        // 禁止右键菜单
-        this.canvas.addEventListener('contextmenu', (e) => {
-            e.preventDefault();
-        });
-
-        // === 键盘事件 ===
-        document.addEventListener('keydown', (e) => {
-            if (!this.keyboardCaptured) return;
-            e.preventDefault();
-            // 跟踪修饰键状态
-            this.updateModifiers(e, true);
-
-            // 先发修饰键
-            if (e.ctrlKey && !this._prevCtrl) this.sendControl('key_press', { key: 'Control' });
-            if (e.altKey && !this._prevAlt) this.sendControl('key_press', { key: 'Alt' });
-            if (e.shiftKey && !this._prevShift) this.sendControl('key_press', { key: 'Shift' });
-            if (e.metaKey && !this._prevMeta) this.sendControl('key_press', { key: 'Meta' });
-
-            this._prevCtrl = e.ctrlKey;
-            this._prevAlt = e.altKey;
-            this._prevShift = e.shiftKey;
-            this._prevMeta = e.metaKey;
-
-            // 发实际按键（跳过纯修饰键）
-            if (!['Control', 'Alt', 'Shift', 'Meta'].includes(e.key)) {
-                this.sendControl('key_press', { key: e.key });
-            }
-        });
-
-        document.addEventListener('keyup', (e) => {
-            if (!this.keyboardCaptured) return;
-            e.preventDefault();
-            this.updateModifiers(e, false);
-
-            // 发实际按键释放
-            if (!['Control', 'Alt', 'Shift', 'Meta'].includes(e.key)) {
-                this.sendControl('key_release', { key: e.key });
-            }
-
-            // 释放松开的修饰键
-            if (!e.ctrlKey && this._prevCtrl) this.sendControl('key_release', { key: 'Control' });
-            if (!e.altKey && this._prevAlt) this.sendControl('key_release', { key: 'Alt' });
-            if (!e.shiftKey && this._prevShift) this.sendControl('key_release', { key: 'Shift' });
-            if (!e.metaKey && this._prevMeta) this.sendControl('key_release', { key: 'Meta' });
-
-            this._prevCtrl = e.ctrlKey;
-            this._prevAlt = e.altKey;
-            this._prevShift = e.shiftKey;
-            this._prevMeta = e.metaKey;
-        });
+    setQuality(qualityValue) {
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify({ action: 'quality', value: qualityValue }));
+        }
     }
 
-    updateModifiers(e, pressed) {
-        // 留作扩展
+    initInputBinding() {
+        document.addEventListener('mousemove', this._onMouseMove);
+        document.addEventListener('mousedown', this._onMouseDown);
+        document.addEventListener('mouseup', this._onMouseUp);
+        this.canvas.addEventListener('wheel', this._onWheel, { passive: false });
+        document.addEventListener('contextmenu', this._onContextMenu);
+        document.addEventListener('keydown', this._onKeyDown);
+        document.addEventListener('keyup', this._onKeyUp);
     }
 
     captureKeyboard() {
         if (!this.keyboardCaptured) {
             this.keyboardCaptured = true;
-            this._prevCtrl = false;
-            this._prevAlt = false;
-            this._prevShift = false;
-            this._prevMeta = false;
             this.onStats({ type: 'keyboard', captured: true });
         }
     }
@@ -274,13 +278,30 @@ class ExhibitionRemoteClient {
     releaseKeyboard() {
         if (this.keyboardCaptured) {
             this.keyboardCaptured = false;
-            // 释放所有可能还按着的键
-            if (this._prevCtrl) this.sendControl('key_release', { key: 'Control' });
-            if (this._prevAlt) this.sendControl('key_release', { key: 'Alt' });
-            if (this._prevShift) this.sendControl('key_release', { key: 'Shift' });
-            if (this._prevMeta) this.sendControl('key_release', { key: 'Meta' });
+            for (let code of Object.keys(this.pressedKeys)) {
+                let vk = this.pressedKeys[code];
+                const buf = new Uint8Array([0x04, 1, 1, vk & 0xFF, (vk >> 8) & 0xFF, 0, 0]);
+                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                    this.ws.send(buf.buffer);
+                }
+            }
+            this.pressedKeys = {};
             this.onStats({ type: 'keyboard', captured: false });
         }
+    }
+
+    destroy() {
+        if (this.ws) {
+            this.ws.close();
+            this.ws = null;
+        }
+        document.removeEventListener('mousemove', this._onMouseMove);
+        document.removeEventListener('mousedown', this._onMouseDown);
+        document.removeEventListener('mouseup', this._onMouseUp);
+        this.canvas.removeEventListener('wheel', this._onWheel);
+        document.removeEventListener('contextmenu', this._onContextMenu);
+        document.removeEventListener('keydown', this._onKeyDown);
+        document.removeEventListener('keyup', this._onKeyUp);
     }
 }
 export default ExhibitionRemoteClient;
