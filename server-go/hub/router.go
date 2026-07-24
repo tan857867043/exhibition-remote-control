@@ -60,6 +60,12 @@ func handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Recovered from agent handler panic: %v", r)
+		}
+	}()
+
 	GlobalHub.mu.Lock()
 	GlobalHub.Agents[deviceID] = conn
 	GlobalHub.DeviceInfos[deviceID] = DeviceInfo{
@@ -203,6 +209,12 @@ func handleStreamSubscribe(w http.ResponseWriter, r *http.Request) {
 		tcp.SetNoDelay(true)
 	}
 	deviceID := r.URL.Query().Get("device_id")
+
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Recovered from subscriber handler panic: %v", r)
+		}
+	}()
 
 	// 创建订阅者：带缓冲通道 + 专用写 goroutine（避免 goroutine 爆炸和写锁竞争）
 	sub := &Subscriber{

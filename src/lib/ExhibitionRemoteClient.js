@@ -125,8 +125,8 @@ class ExhibitionRemoteClient {
                 return;
             } else if (frameType === 0x01) {
                 // === 批量增量块消息 (v2) ===
-                // 格式: [0x01][block_count:2 BE][block1...][block2...]
-                // 每个 block: [x:2][y:2][w:2][h:2][encoding:1][data_len:2][data...]
+                this._processingVideo = true;
+                try {
                 this.onStats({ type: 'frame', frameType: 0x01, byteLength: 0 });
                 if (totalSize < 3) return;
                 const numBlocks = (buf[1] << 8) | buf[2];
@@ -134,8 +134,8 @@ class ExhibitionRemoteClient {
 
                 // 逐块解析 + 渲染到离屏 canvas
                 let offset = 3;
-                const BLOCK_HEADER = 11; // x(2)+y(2)+w(2)+h(2)+encoding(1)+data_len(2)
-                const jpegBatch = []; // 收集 JPEG 块批量解码
+                const BLOCK_HEADER = 11;
+                const jpegBatch = [];
 
                 for (let i = 0; i < numBlocks && offset + BLOCK_HEADER <= totalSize; i++) {
                     const bx = (buf[offset] << 8) | buf[offset+1];
@@ -148,14 +148,11 @@ class ExhibitionRemoteClient {
                     if (dataLen === 0 || offset + dataLen > totalSize) break;
 
                     if (encoding === 1) {
-                        // BGRA raw — putImageData 直接渲染
-                        // buf.slice() 复制数据避免引用原始 ArrayBuffer
                         const rawData = new Uint8Array(buf.slice(offset, offset + dataLen));
                         const clampedArray = new Uint8ClampedArray(rawData.buffer, rawData.byteOffset, dataLen);
                         const imageData = new ImageData(clampedArray, bw, bh);
                         this.offscreenCtx.putImageData(imageData, bx, by);
                     } else {
-                        // JPEG — 收集后批量解码
                         jpegBatch.push({ x: bx, y: by, w: bw, h: bh, data: buf.slice(offset, offset + dataLen) });
                     }
                     offset += dataLen;
@@ -163,7 +160,6 @@ class ExhibitionRemoteClient {
 
                 // JPEG 块分批解码（每批 4 个并发）
                 const batchMySeq = ++this.frameSeq;
-                this._processingVideo = true;
                 const BATCH_SIZE = 4;
                 for (let i = 0; i < jpegBatch.length; i += BATCH_SIZE) {
                     const batch = jpegBatch.slice(i, i + BATCH_SIZE);
@@ -172,7 +168,6 @@ class ExhibitionRemoteClient {
                         return { bitmap, x: b.x, y: b.y, w: b.w, h: b.h };
                     }));
                     if (batchMySeq !== this.frameSeq) {
-                        // 过期帧，释放所有 bitmap
                         for (const {bitmap} of results) bitmap.close();
                         break;
                     }
@@ -184,7 +179,9 @@ class ExhibitionRemoteClient {
                 if (batchMySeq === this.frameSeq) {
                     this.renderedFrames++;
                 }
-                this._processingVideo = false;
+                } finally {
+                    this._processingVideo = false;
+                }
                 // 通过 rAF 渲染队列拷贝到显示 canvas
                 this.pendingRender = true;
                 if (this.rAFId === null) {
@@ -192,7 +189,8 @@ class ExhibitionRemoteClient {
                 }
             } else {
                 // === 全帧消息 ===
-                // 格式: [frame_type(1)][x(2)][y(2)][w(2)][h(2)][jpeg_data]
+                this._processingVideo = true;
+                try {
                 const HEADER_SIZE = 9;
                 if (totalSize < HEADER_SIZE) return;
                 const x = (buf[1] << 8) | buf[2];
@@ -214,13 +212,11 @@ class ExhibitionRemoteClient {
 
                 try {
                     const mySeq = ++this.frameSeq;
-                    this._processingVideo = true;
                     const bitmap = await createImageBitmap(new Blob([jpegData]));
-                    if (mySeq !== this.frameSeq) { bitmap.close(); this._processingVideo = false; return; } // 过期帧，丢弃
+                    if (mySeq !== this.frameSeq) { bitmap.close(); return; } // 过期帧，丢弃
                     this.offscreenCtx.drawImage(bitmap, 0, 0, w, h);
                     bitmap.close();
                     this.renderedFrames++;
-                    this._processingVideo = false;
                     // 通过 rAF 渲染队列拷贝到显示 canvas
                     this.pendingRender = true;
                     if (this.rAFId === null) {
@@ -228,6 +224,8 @@ class ExhibitionRemoteClient {
                     }
                 } catch (err) {
                     console.error("Decode error:", err);
+                }
+                } finally {
                     this._processingVideo = false;
                 }
             }
