@@ -7,6 +7,9 @@ coverage/
 .env*
 !.env.example
 
+# Trae IDE internal
+.trae/
+
 # Rust build artifacts
 agent-rust/target/
 agent-rust/.device_id
