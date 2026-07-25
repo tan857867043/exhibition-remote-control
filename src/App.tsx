@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import ExhibitionRemoteClient from "./lib/ExhibitionRemoteClient.js";
-import { Monitor, WifiOff, Settings, Mouse, Cast, Lock, Terminal, Router, X, Maximize, Minimize, ChevronLeft, Zap, Image as ImageIcon, Activity, Download } from "lucide-react";
+import { Monitor, WifiOff, Settings, Mouse, Cast, Lock, Terminal, Router, X, Maximize, Minimize, ChevronLeft, Zap, Image as ImageIcon, Activity, FolderUp, UploadCloud } from "lucide-react";
+import { FileTransferModal, TransferTask } from "./components/FileTransferModal";
 
 interface DeviceInfo {
   id: string;
@@ -20,7 +21,6 @@ export default function App() {
   const [viewMode, setViewMode] = useState<"devices" | "remote">("devices");
   
   const [fps, setFps] = useState(0);
-  const [recvFps, setRecvFps] = useState(0);
   const [dataRate, setDataRate] = useState(0);
   const [blockCount, setBlockCount] = useState(0);
   const [resolution, setResolution] = useState("--");
@@ -40,9 +40,89 @@ export default function App() {
   const [editingDeviceId, setEditingDeviceId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
 
+  const [fileModalOpen, setFileModalOpen] = useState(false);
+  const [targetDir, setTargetDir] = useState("C:\\Users\\Public\\Downloads");
+  const [transferTasks, setTransferTasks] = useState<TransferTask[]>([]);
+  const [isCanvasDragging, setIsCanvasDragging] = useState(false);
+
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const clientRef = useRef<any>(null);
+
+  const handleSendFiles = async (files: FileList | File[], dir: string) => {
+    if (!clientRef.current) {
+      alert("请先连接到远程设备");
+      return;
+    }
+    const fileArray = Array.from(files);
+    for (const file of fileArray) {
+      const taskId = `task_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+      const newTask: TransferTask = {
+        id: taskId,
+        fileName: file.name,
+        fileSize: file.size,
+        targetDir: dir,
+        progress: 0,
+        speedMBs: 0,
+        status: "transferring",
+        timestamp: new Date().toLocaleTimeString(),
+      };
+
+      setTransferTasks((prev) => [newTask, ...prev]);
+
+      try {
+        await clientRef.current.sendFile(
+          file,
+          dir,
+          (progress: number, speedMBs: number, status: string) => {
+            setTransferTasks((prev) =>
+              prev.map((t) =>
+                t.id === taskId
+                  ? {
+                      ...t,
+                      progress,
+                      speedMBs,
+                      status: status === "completed" ? "completed" : "transferring",
+                    }
+                  : t
+              )
+            );
+          }
+        );
+      } catch (err: any) {
+        console.error("File transfer error:", err);
+        setTransferTasks((prev) =>
+          prev.map((t) =>
+            t.id === taskId
+              ? { ...t, status: "failed", error: err?.message || "传输失败" }
+              : t
+          )
+        );
+      }
+    }
+  };
+
+  const handleCanvasDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsCanvasDragging(true);
+  };
+
+  const handleCanvasDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsCanvasDragging(false);
+  };
+
+  const handleCanvasDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsCanvasDragging(false);
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      setFileModalOpen(true);
+      handleSendFiles(e.dataTransfer.files, targetDir);
+    }
+  };
   
   const fpsCounterRef = useRef(0);
   const bytesReceivedRef = useRef(0);
@@ -67,22 +147,6 @@ export default function App() {
       console.error(e);
       setStatus("disconnected");
       setDevices([]);
-    }
-  };
-
-  const handleDownloadAgent = async () => {
-    try {
-      const res = await fetch(`${serverUrl}/agents`);
-      if (!res.ok) throw new Error('下载失败');
-      const blob = await res.blob();
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = 'exhibition-agent.exe';
-      a.click();
-      URL.revokeObjectURL(a.href);
-    } catch (e) {
-      console.error(e);
-      alert('Agent 下载失败，请确认服务端已编译 Agent');
     }
   };
 
@@ -150,28 +214,19 @@ export default function App() {
     if (viewMode !== 'remote') return;
 
     const fpsTimer = setInterval(() => {
-      if (clientRef.current && clientRef.current.getRenderedFrameCount) {
-        const rendered = clientRef.current.getRenderedFrameCount();
-        const received = clientRef.current.getReceivedFrameCount();
-        setFps(Math.round(rendered / 2));
-        setRecvFps(Math.round(received / 2));
-        clientRef.current.resetFrameCount();
-      } else {
-        setFps(fpsCounterRef.current);
-        setRecvFps(fpsCounterRef.current);
-      }
+      setFps(fpsCounterRef.current);
       fpsCounterRef.current = 0;
-    }, 2000);
+    }, 1000);
 
     const dataRateTimer = setInterval(() => {
       setDataRate(Math.round(bytesReceivedRef.current / 1024));
       bytesReceivedRef.current = 0;
-    }, 2000);
+    }, 1000);
 
     const blockTimer = setInterval(() => {
       setBlockCount(blockCounterRef.current);
       blockCounterRef.current = 0;
-    }, 2000);
+    }, 1000);
 
     const resTimer = setInterval(() => {
       if (clientRef.current && clientRef.current.maxFullW > 0) {
@@ -189,9 +244,9 @@ export default function App() {
 
   useEffect(() => {
     if (viewMode !== 'remote' || !clientRef.current) return;
-    let v = 80;
-    if (qualityMode === 'smooth') v = 50;
-    else if (qualityMode === 'hd') v = 95;
+    let v = 50;
+    if (qualityMode === 'smooth') v = 30;
+    else if (qualityMode === 'hd') v = 75;
     clientRef.current.setQuality(v);
   }, [qualityMode, viewMode]);
 
@@ -330,9 +385,6 @@ export default function App() {
               <button onClick={loadDevices} className="px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg hover:bg-slate-700 text-sm font-bold transition-all text-slate-200 shadow-sm flex items-center gap-2">
                 <Router className="w-4 h-4" /> 刷新
               </button>
-              <button onClick={handleDownloadAgent} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 border border-indigo-500/50 rounded-lg text-sm font-bold transition-all text-white shadow-sm flex items-center gap-2 shadow-[0_0_12px_rgba(99,102,241,0.25)]">
-                <Download className="w-4 h-4" /> 下载 Agent
-              </button>
             </div>
           </header>
 
@@ -389,11 +441,8 @@ export default function App() {
                             alt="Screen Thumbnail"
                             className="w-full h-full object-cover opacity-70 group-hover:opacity-100 transition-opacity"
                             onError={(e) => {
-                              const img = e.target as HTMLImageElement;
-                              if (img.parentElement) {
-                                img.style.display = 'none';
-                                img.parentElement.innerHTML = '<div class="text-slate-700 flex flex-col items-center"><svg class="w-6 h-6 mb-1" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg><span class="text-[10px]">无缩略图</span></div>';
-                              }
+                              (e.target as HTMLImageElement).style.display = 'none';
+                              (e.target as HTMLImageElement).parentElement!.innerHTML = '<div class="text-slate-700 flex flex-col items-center"><svg class="w-6 h-6 mb-1" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg><span class="text-[10px]">无缩略图</span></div>';
                             }}
                           />
                           <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 bg-indigo-900/40 transition-opacity">
@@ -465,15 +514,23 @@ export default function App() {
               </button>
             </div>
 
-            <div className="flex items-center gap-4">
+            <div className="flex items-center gap-3">
+              <button 
+                onClick={() => setFileModalOpen(true)}
+                className="px-3 py-1.5 bg-blue-600/90 hover:bg-blue-500 text-white rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 shadow-md shadow-blue-500/20 active:scale-95"
+                title="文件传输"
+              >
+                <FolderUp className="w-4 h-4" />
+                <span>文件传输</span>
+                {transferTasks.some(t => t.status === "transferring") && (
+                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                )}
+              </button>
+
               <div className="flex gap-4 text-xs font-mono text-slate-400 mr-2">
                 <div className="flex flex-col items-end">
-                  <span className="text-[9px] uppercase">显示</span>
+                  <span className="text-[9px] uppercase">FPS</span>
                   <span className={fps > 20 ? "text-emerald-400 font-bold" : "text-amber-400 font-bold"}>{fps}</span>
-                </div>
-                <div className="flex flex-col items-end">
-                  <span className="text-[9px] uppercase">接收</span>
-                  <span className={recvFps > 20 ? "text-sky-400 font-bold" : "text-amber-400 font-bold"}>{recvFps}</span>
                 </div>
                 <div className="flex flex-col items-end">
                   <span className="text-[9px] uppercase">KB/s</span>
@@ -494,12 +551,28 @@ export default function App() {
             </div>
           </div>
 
-          <div className="flex-1 relative flex items-center justify-center overflow-hidden">
+          <div 
+            onDragOver={handleCanvasDragOver}
+            onDragLeave={handleCanvasDragLeave}
+            onDrop={handleCanvasDrop}
+            className="flex-1 relative flex items-center justify-center overflow-hidden"
+          >
             <canvas 
               ref={canvasRef} 
-              className="w-full h-full object-contain cursor-crosshair z-10"
-              style={{ imageRendering: qualityMode === 'hd' ? 'crisp-edges' : 'auto', filter: qualityMode === 'smooth' ? 'contrast(1.05)' : 'none' }}
+              className="w-full h-full object-contain z-10"
+              style={{ filter: qualityMode === 'smooth' ? 'contrast(1.05)' : 'none' }} // Fake visual feedback for modes
             />
+
+            {/* Canvas Drag and Drop Overlay */}
+            {isCanvasDragging && (
+              <div className="absolute inset-0 z-50 bg-blue-950/80 backdrop-blur-md border-4 border-dashed border-blue-400 flex flex-col items-center justify-center text-white gap-3 animate-in fade-in duration-150">
+                <div className="p-4 bg-blue-500/20 border border-blue-400/30 rounded-2xl shadow-2xl">
+                  <UploadCloud className="w-12 h-12 text-blue-400 animate-bounce" />
+                </div>
+                <h3 className="text-xl font-bold">松开鼠标投送文件到远程设备</h3>
+                <p className="text-xs text-blue-200">保存路径: <span className="font-mono text-white">{targetDir}</span></p>
+              </div>
+            )}
             
             <div className="absolute bottom-6 right-6 flex gap-2 pointer-events-none z-30 opacity-70">
               <div className="bg-slate-900/80 backdrop-blur border border-slate-800 px-3 py-1.5 rounded text-[10px] text-slate-300 font-bold flex items-center gap-2">
@@ -509,6 +582,17 @@ export default function App() {
           </div>
         </div>
       )}
+
+      <FileTransferModal
+        isOpen={fileModalOpen}
+        onClose={() => setFileModalOpen(false)}
+        deviceName={currentDeviceId ? getDeviceName(currentDeviceId) : "远程设备"}
+        targetDir={targetDir}
+        setTargetDir={setTargetDir}
+        onSendFiles={handleSendFiles}
+        tasks={transferTasks}
+        onClearHistory={() => setTransferTasks([])}
+      />
     </div>
   );
 }

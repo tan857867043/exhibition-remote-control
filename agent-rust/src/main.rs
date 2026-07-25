@@ -1,29 +1,22 @@
 mod dirty_rect;
 mod capture;
 mod encoder;
-mod config;
 
 use capture::ScreenCapturer;
 use dirty_rect::GridManager;
-use encoder::{build_binary_packet, build_batch_packet_v2, extract_block_rgba_into};
-use winapi::um::winuser::{GetCursorPos, GetCursor, LoadCursorW};
-use winapi::shared::windef::POINT;
+use encoder::{build_binary_packet, extract_block_rgba_into, downsample_bgra_2x};
 use enigo::{Enigo, MouseControllable, MouseButton, KeyboardControllable, Key};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
 use sysinfo::System;
 use tokio_tungstenite::tungstenite::Message;
 use turbojpeg::{Compressor, Image, PixelFormat};
-use xxhash_rust::xxh64::xxh64;
-use tokio::select;
 
-// 全局 CPU 负载（由独立监控任务定期刷新，避免每帧 sysinfo 开销）
+// 全局 CPU 负载（由独立监控任务定期刷新，避免主循环高频 sysinfo 开销）
 static CPU_LOAD: AtomicU32 = AtomicU32::new(0);
 
-#[allow(dead_code)]
 #[derive(Deserialize, Debug)]
 struct ControlCmd {
     device_id: String,
@@ -32,7 +25,6 @@ struct ControlCmd {
     y: Option<i32>,
     button: Option<String>,
     key: Option<String>,
-    #[allow(dead_code)]
     key_code: Option<u16>,
 }
 
@@ -52,13 +44,13 @@ struct QualityEngine {
 impl QualityEngine {
     fn new() -> Self {
         Self {
-            quality: 95,
-            min_quality: 85,
+            quality: 75,
+            min_quality: 30,
             max_quality: 95,
             framerate: 30,
             keyframe_interval: 60,
             frame_count: 0,
-            target_rate_kbps: 150000.0,
+            target_rate_kbps: 50000.0,
             avg_encode_ms: 0.0,
             avg_send_kbps: 0.0,
         }
@@ -72,35 +64,37 @@ impl QualityEngine {
 
         // 动态帧率与画质权衡 (视频模式保帧率降画质，静态模式保画质降帧率)
         if change_ratio > 0.40 {
+            // 大面积变化 (视频播放)：降低最高帧率至 30 FPS 以保护 CPU，画质保持及格线
             self.framerate = 30;
-            self.quality = (self.quality - 2).max(80);
+            self.quality = (self.quality - 8).max(50);
         } else if change_ratio > 0.15 {
-            self.framerate = 30;
-            self.quality = (self.quality - 1).max(80);
+            self.framerate = 20;
+            self.quality = (self.quality - 3).max(65);
         } else if change_ratio > 0.02 {
-            self.framerate = 30;
-            self.quality = (self.quality + 1).min(self.max_quality);
+            self.framerate = 15;
+            self.quality = (self.quality + 2).min(80);
         } else {
-            self.framerate = 30;
-            self.quality = (self.quality + 2).min(self.max_quality);
+            // 静态画面 (文本阅读)：极低帧率，最高画质 (完美清晰)
+            self.framerate = 5;
+            self.quality = (self.quality + 5).min(self.max_quality);
         }
 
         // 带宽熔断（优先级最高）
-        if send_kbps > self.target_rate_kbps * 0.90 {
+        if send_kbps > self.target_rate_kbps * 0.85 {
+            self.framerate = self.framerate.min(8);
+            self.quality = (self.quality - 12).max(self.min_quality);
+        } else if send_kbps > self.target_rate_kbps * 0.6 {
             self.framerate = self.framerate.min(15);
-            self.quality = (self.quality - 3).max(self.min_quality);
-        } else if send_kbps > self.target_rate_kbps * 0.75 {
-            self.framerate = self.framerate.min(24);
-            self.quality = (self.quality - 1).max(self.min_quality);
+            self.quality = (self.quality - 6).max(self.min_quality);
         }
 
         // CPU 熔断
-        if cpu_load > 90.0 {
+        if cpu_load > 80.0 {
+            self.framerate = self.framerate.min(8);
+            self.quality = (self.quality - 10).max(self.min_quality);
+        } else if cpu_load > 60.0 {
             self.framerate = self.framerate.min(15);
-            self.quality = (self.quality - 3).max(self.min_quality);
-        } else if cpu_load > 75.0 {
-            self.framerate = self.framerate.min(24);
-            self.quality = (self.quality - 1).max(self.min_quality);
+            self.quality = (self.quality - 5).max(self.min_quality);
         }
 
         // 编码耗时调整
@@ -130,13 +124,6 @@ impl QualityEngine {
             self.quality, self.framerate, self.avg_encode_ms, self.avg_send_kbps
         );
     }
-}
-
-#[derive(PartialEq)]
-enum CaptureMode {
-    Incremental,   // 增量脏矩形模式（<15% 变化）
-    Balanced,      // 平衡模式（15%~25%）
-    VideoFullFrame, // 视频全帧模式（≥25% 连续 3 帧）
 }
 
 fn map_key(key_str: &str) -> Option<Key> {
@@ -170,98 +157,6 @@ fn map_key(key_str: &str) -> Option<Key> {
     }
 }
 
-fn vk_to_key(vk: u16) -> Option<Key> {
-    match vk {
-        0x41..=0x5A => Some(Key::Layout((b'A' + (vk - 0x41) as u8) as char)),
-        0x30..=0x39 => Some(Key::Layout((b'0' + (vk - 0x30) as u8) as char)),
-        0x08 => Some(Key::Backspace),
-        0x09 => Some(Key::Tab),
-        0x0D => Some(Key::Return),
-        0x10 | 0xA0 | 0xA1 => Some(Key::Shift),
-        0x11 | 0xA2 | 0xA3 => Some(Key::Control),
-        0x12 | 0xA4 | 0xA5 => Some(Key::Alt),
-        0x5B | 0x5C => Some(Key::Meta),
-        0x1B => Some(Key::Escape),
-        0x20 => Some(Key::Space),
-        0x21 => Some(Key::PageUp),
-        0x22 => Some(Key::PageDown),
-        0x23 => Some(Key::End),
-        0x24 => Some(Key::Home),
-        0x25 => Some(Key::LeftArrow),
-        0x26 => Some(Key::UpArrow),
-        0x27 => Some(Key::RightArrow),
-        0x28 => Some(Key::DownArrow),
-        0x2D => Some(Key::Insert),
-        0x2E => Some(Key::Delete),
-        0x14 => Some(Key::CapsLock),
-        0x70 => Some(Key::F1), 0x71 => Some(Key::F2), 0x72 => Some(Key::F3),
-        0x73 => Some(Key::F4), 0x74 => Some(Key::F5), 0x75 => Some(Key::F6),
-        0x76 => Some(Key::F7), 0x77 => Some(Key::F8), 0x78 => Some(Key::F9),
-        0x79 => Some(Key::F10), 0x7A => Some(Key::F11), 0x7B => Some(Key::F12),
-        _ => None,
-    }
-}
-
-fn handle_binary_msg(enigo: &mut Enigo, data: &[u8]) {
-    if data.is_empty() { return; }
-    match data[0] {
-        0x01 => {
-            if data.len() < 6 { return; }
-            let x = data[2] as i32 | ((data[3] as i32) << 8);
-            let y = data[4] as i32 | ((data[5] as i32) << 8);
-            enigo.mouse_move_to(x, y);
-        }
-        0x02 => {
-            if data.len() < 3 { return; }
-            let button = match data[1] {
-                0 => MouseButton::Left,
-                1 => MouseButton::Right,
-                2 => MouseButton::Middle,
-                _ => return,
-            };
-            if data[2] == 1 {
-                enigo.mouse_down(button);
-            } else {
-                enigo.mouse_up(button);
-            }
-        }
-        0x03 => {
-            if data.len() < 4 { return; }
-            let delta = (data[2] as i16) | ((data[3] as i16) << 8);
-            enigo.mouse_scroll_y(delta as i32);
-        }
-        0x04 => {
-            if data.len() < 2 { return; }
-            let count = data[1] as usize;
-            let mut offset = 2;
-            for _ in 0..count {
-                if offset + 3 > data.len() { break; }
-                let action = data[offset];
-                let vk = data[offset + 1] as u16 | ((data[offset + 2] as u16) << 8);
-                offset += 3;
-                if let Some(key) = vk_to_key(vk) {
-                    if action == 0 {
-                        enigo.key_down(key);
-                    } else {
-                        enigo.key_up(key);
-                    }
-                }
-            }
-        }
-        0x05 => {
-            if data.len() < 2 { return; }
-            if data[1] == 10 {
-                enigo.key_down(Key::Control);
-                enigo.key_down(Key::Alt);
-                enigo.key_click(Key::Delete);
-                enigo.key_up(Key::Alt);
-                enigo.key_up(Key::Control);
-            }
-        }
-        _ => {}
-    }
-}
-
 /// 计算 CPU 平均使用率
 fn cpus_avg(sys: &System) -> f32 {
     let cpus = sys.cpus();
@@ -270,93 +165,9 @@ fn cpus_avg(sys: &System) -> f32 {
     }
 }
 
-// === Cursor Pseudo-Encoding: 跟踪光标形状变化 ===
-struct CursorShapeTracker {
-    last_handle: isize,
-    h_arrow: isize,
-    h_ibeam: isize,
-    h_hand: isize,
-}
-
-impl CursorShapeTracker {
-    fn new() -> Self {
-        unsafe {
-            Self {
-                last_handle: 0,
-                h_arrow: LoadCursorW(std::ptr::null_mut(), (32512u16 as usize) as *const u16) as isize,
-                h_ibeam: LoadCursorW(std::ptr::null_mut(), (32513u16 as usize) as *const u16) as isize,
-                h_hand: LoadCursorW(std::ptr::null_mut(), (32649u16 as usize) as *const u16) as isize,
-            }
-        }
-    }
-
-    fn check_change(&mut self) -> Option<u8> {
-        unsafe {
-            let h = GetCursor() as isize;
-            if h != self.last_handle {
-                self.last_handle = h;
-                let cursor_type = if h == self.h_arrow { 0 }
-                    else if h == self.h_ibeam { 1 }
-                    else if h == self.h_hand { 2 }
-                    else { 0 };
-                Some(cursor_type)
-            } else {
-                None
-            }
-        }
-    }
-}
-
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     println!("Exhibition Agent starting (industry-grade pipeline)...");
-
-    let server_url = config::resolve_server_url();
-    let host_port = server_url
-        .strip_prefix("ws://")
-        .or_else(|| server_url.strip_prefix("wss://"))
-        .unwrap_or(&server_url)
-        .to_string();
-    let host_port = host_port.split('/').next().unwrap_or(&host_port).to_string();
-
-    let device_id = std::fs::read_to_string(".device_id").unwrap_or_else(|_| {
-        let mut sys = System::new_all();
-        sys.refresh_all();
-        let host = System::host_name().unwrap_or_else(|| "UnknownHost".to_string());
-        let new_id = format!("{}_{}_{}", host, std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
-        let hash = crc32fast::hash(new_id.as_bytes());
-        let id_str = format!("{:08x}", hash);
-        let _ = std::fs::write(".device_id", &id_str);
-        id_str
-    }).trim().to_string();
-
-    let mut sys = System::new_all();
-    sys.refresh_all();
-    let host_name = System::host_name().unwrap_or_else(|| "Unknown Device".to_string());
-    let os_name = format!("{} {}", System::name().unwrap_or_else(|| "Unknown OS".to_string()), System::os_version().unwrap_or_default());
-
-    let cpu_brand = sys.cpus().first().map(|c| c.brand()).unwrap_or("Unknown CPU").to_string();
-    let mem_gb = (sys.total_memory() as f64 / 1_073_741_824.0).round() as u64;
-
-    let mut mac_addr = String::new();
-    let networks = sysinfo::Networks::new_with_refreshed_list();
-    for (name, data) in &networks {
-        if name != "lo" && !name.starts_with("Loopback") {
-            mac_addr = format!("{:?}", data.mac_address());
-            break;
-        }
-    }
-
-    let host_name_encoded = host_name.replace(" ", "%20");
-    let os_name_encoded = os_name.replace(" ", "%20");
-    let cpu_brand_encoded = cpu_brand.replace(" ", "%20");
-    let mac_encoded = mac_addr.replace(" ", "%20");
-
-    let base_url = server_url.trim_end_matches('/');
-    let url = format!("{}/agent/register?device_id={}&device_name={}&os={}&cpu={}&ram={}GB&mac={}",
-        base_url, device_id, host_name_encoded, os_name_encoded, cpu_brand_encoded, mem_gb, mac_encoded);
-
-    println!("Connecting to hub at {}", url);
 
     let mut capturer = ScreenCapturer::new();
     let screen_w = capturer.width;
@@ -370,44 +181,64 @@ async fn main() {
     let mut send_history: VecDeque<(std::time::Instant, usize)> = VecDeque::new();
     let mut status_log_timer = std::time::Instant::now();
     let mut first_frame = true;
-    let mut capture_mode = CaptureMode::Incremental;
-    let mut dirty_history: VecDeque<f32> = VecDeque::with_capacity(4);
-    let prev_hash_arc = Arc::new(tokio::sync::Mutex::new(None::<u64>));
 
-    let tcp = tokio::net::TcpStream::connect(&host_port).await.expect("Failed to connect");
-    let _ = tcp.set_nodelay(true);
-    let (ws_stream, _) = tokio_tungstenite::client_async(url, tcp).await.expect("Failed to connect");
+    // Generate or load Device ID
+    let device_id = std::fs::read_to_string(".device_id").unwrap_or_else(|_| {
+        let mut sys = System::new_all();
+        sys.refresh_all();
+        let host = System::host_name().unwrap_or_else(|| "UnknownHost".to_string());
+        let new_id = format!("{}_{}_{}", host, std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+        // Simple hash to make it look like an ID
+        let hash = crc32fast::hash(new_id.as_bytes());
+        let id_str = format!("{:08x}", hash);
+        let _ = std::fs::write(".device_id", &id_str);
+        id_str
+    }).trim().to_string();
 
+    let mut sys = System::new_all();
+    sys.refresh_all();
+    let host_name = System::host_name().unwrap_or_else(|| "Unknown Device".to_string());
+    let os_name = format!("{} {}", System::name().unwrap_or_else(|| "Unknown OS".to_string()), System::os_version().unwrap_or_default());
+    
+    let cpu_brand = sys.cpus().first().map(|c| c.brand()).unwrap_or("Unknown CPU").to_string();
+    let mem_gb = (sys.total_memory() as f64 / 1_073_741_824.0).round() as u64;
+    
+    let mut mac_addr = String::new();
+    let networks = sysinfo::Networks::new_with_sysinfo();
+    for (name, data) in &networks {
+        if name != "lo" && !name.starts_with("Loopback") {
+            mac_addr = format!("{:?}", data.mac_address());
+            break;
+        }
+    }
+
+    // URL encode strings
+    let host_name_encoded = host_name.replace(" ", "%20");
+    let os_name_encoded = os_name.replace(" ", "%20");
+    let cpu_brand_encoded = cpu_brand.replace(" ", "%20");
+    let mac_encoded = mac_addr.replace(" ", "%20");
+
+    let url = format!("ws://127.0.0.1:38921/agent/register?device_id={}&device_name={}&os={}&cpu={}&ram={}GB&mac={}", 
+        device_id, host_name_encoded, os_name_encoded, cpu_brand_encoded, mem_gb, mac_encoded);
+
+    println!("Connecting to hub at {}", url);
+    let (ws_stream, _) = tokio_tungstenite::connect_async(url).await.expect("Failed to connect");
     let (mut write, mut read) = ws_stream.split();
 
-    // === 三通道 MPSC 解耦网络发送 ===
-    // 文本消息通道（ping/pong/telemetry/exec_result）
-    let (_text_tx, mut text_rx) = tokio::sync::mpsc::channel::<Message>(256);
-    // 增量脏矩形流通道（静态/低动态画面，容量 8192）
-    let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<Message>(8192);
-    // 关键全帧流通道（视频模式、首次连接、大幅跳转，容量 64）
-    let (keyframe_tx, mut keyframe_rx) = tokio::sync::mpsc::channel::<Message>(64);
+    // === 优化1: MPSC 通道解耦网络发送 ===
+    // 容量 8192：防止高频增量块溢出导致画面撕裂
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(8192);
 
-    // 专用异步发送任务：同时监听三个通道，关键帧优先
+    // 专用异步发送任务
     tokio::spawn(async move {
-        loop {
-            select! {
-                biased;
-                Some(msg) = keyframe_rx.recv() => {
-                    if write.send(msg).await.is_err() { break; }
-                }
-                Some(msg) = delta_rx.recv() => {
-                    if write.send(msg).await.is_err() { break; }
-                }
-                Some(msg) = text_rx.recv() => {
-                    if write.send(msg).await.is_err() { break; }
-                }
-                else => break,
+        while let Some(msg) = rx.recv().await {
+            if write.send(msg).await.is_err() {
+                break;
             }
         }
     });
 
-    // === CPU 监控任务（独立定时器 500ms 刷新，避免每帧 sysinfo 开销）===
+    // === 优化3: CPU 监控任务（独立定时器 500ms 刷新，避免每帧 sysinfo 开销）===
     tokio::spawn(async move {
         let mut sys = System::new_all();
         loop {
@@ -427,11 +258,7 @@ async fn main() {
     tokio::spawn(async move {
         let mut enigo = Enigo::new();
         while let Some(msg) = read.next().await {
-            match msg {
-                Ok(Message::Binary(data)) => {
-                    handle_binary_msg(&mut enigo, &data);
-                }
-                Ok(Message::Text(text)) => {
+            if let Ok(Message::Text(text)) = msg {
                 if let Ok(cmd) = serde_json::from_str::<ControlCmd>(&text) {
                     match cmd.action.as_str() {
                         "mouse_move" => {
@@ -488,116 +315,79 @@ async fn main() {
                         _ => {}
                     }
                 }
-                }
-                _ => {}
             }
         }
     });
 
-    // === 预分配可复用 buffer，避免高频 malloc ===
+    // === 优化2: 预分配可复用 buffer，避免高频 malloc ===
     let mut block_buffer: Vec<u8> = Vec::with_capacity(grid_size * grid_size * 4);
+    let mut downsample_buffer: Vec<u8> = Vec::with_capacity(screen_w * screen_h); // (w/2 * h/2 * 4)
 
-    // === Cursor Pseudo-Encoding: 初始化光标跟踪器 ===
-    let mut cursor_tracker = CursorShapeTracker::new();
+    // === 核心优化: 将繁重的 CPU 捕获和压缩剥离到独立的 OS 线程 ===
+    // 这样就不会阻塞 Tokio 的异步网络 I/O（WebSocket 读写可以极速响应）
+    std::thread::spawn(move || {
+        // 主循环：捕获→检测→自适应→编码→非阻塞发送
+        loop {
+            let frame_start = std::time::Instant::now();
 
-    let mut frame_counter: u64 = 0;
-    const FORCE_FRAME_INTERVAL: u64 = 6;
+            if let Some(frame_data) = capturer.capture_frame() {
+                let (dirty_blocks, change_ratio) = grid_mgr.detect_dirty_blocks(&frame_data);
 
-    // 主循环：捕获→检测→自适应→编码→非阻塞发送（MPSC try_send 解耦网络 I/O）
-    loop {
-        let frame_start = std::time::Instant::now();
-        frame_counter = frame_counter.wrapping_add(1);
-        let force_send = frame_counter % FORCE_FRAME_INTERVAL == 0;
+                // === 优化3: 从 AtomicU32 读取节流后的 CPU 负载 ===
+                let cpu_load = CPU_LOAD.load(Ordering::Relaxed) as f32 / 10.0;
 
-        if let Some(frame_data) = capturer.capture_frame() {
-            let frame_hash = xxh64(&frame_data, 0);
-            let mut ph = prev_hash_arc.lock().await;
-            let is_static = *ph == Some(frame_hash) && !force_send;
-            if is_static {
-                drop(ph);
-            } else {
-            *ph = Some(frame_hash);
-            drop(ph);
+                let is_video = !first_frame && change_ratio > 0.50;
+                let _is_static = change_ratio < 0.02;
+                let force_key = quality_engine.need_keyframe();
+                first_frame = false;
 
-            let (dirty_blocks, change_ratio) = grid_mgr.detect_dirty_blocks(&frame_data);
-
-            // === 从 AtomicU32 读取节流后的 CPU 负载 ===
-            let cpu_load = CPU_LOAD.load(Ordering::Relaxed) as f32 / 10.0;
-
-            // === 画面活跃度检测：滑动窗口判定视频模式 ===
-            if !first_frame {
-                dirty_history.push_back(change_ratio);
-                if dirty_history.len() > 3 {
-                    dirty_history.pop_front();
-                }
-                
-                let video_mode = dirty_history.len() == 3 
-                    && dirty_history.iter().all(|&r| r >= 0.25);
-                let static_mode = change_ratio < 0.15;
-                
-                capture_mode = if video_mode {
-                    CaptureMode::VideoFullFrame
-                } else if static_mode {
-                    CaptureMode::Incremental
-                } else {
-                    CaptureMode::Balanced
-                };
-            }
-            first_frame = false;
-
-            let is_video = capture_mode == CaptureMode::VideoFullFrame;
-            let force_key = quality_engine.need_keyframe();
-
-            if is_video {
-                compressor.set_quality(85);
-            } else {
                 compressor.set_quality(quality_engine.quality);
-            }
-            compressor.set_subsamp(turbojpeg::Subsamp::None);
+                compressor.set_subsamp(if is_video { turbojpeg::Subsamp::Sub2x2 } else { turbojpeg::Subsamp::None });
 
-            let mut frame_send_bytes = 0usize;
-            let mut encode_total_ms = 0u64;
-            let mut network_dropped = false;
+                let mut frame_send_bytes = 0usize;
+                let mut encode_total_ms = 0u64;
+                let mut network_dropped = false;
 
-            // 视频/高变化场景优先发全帧（客户端单张 JPEG 解码比数百块快 10x 以上）
-            // 平衡模式也发全帧 → 避免前端逐个解码百个小块（每个块独立 createImageBitmap）
-            let full_frame_threshold = if is_video { 0.30 } else { 0.40 };
-            let should_full_frame = is_video || force_key
-                || (dirty_blocks.len() as f32) > (grid_mgr.last_hashes.len() as f32 * full_frame_threshold);
-            if should_full_frame {
-                // 全帧模式
-                let encode_start = std::time::Instant::now();
-                
-                let jpeg_result = compressor.compress_to_vec(Image {
-                    pixels: &frame_data, width: screen_w, height: screen_h, pitch: screen_w * 4, format: PixelFormat::BGRA,
-                });
-
-                if let Ok(jpeg_bytes) = jpeg_result {
-                    encode_total_ms = encode_start.elapsed().as_millis() as u64;
-                    frame_send_bytes = jpeg_bytes.len();
+                if is_video || force_key || (dirty_blocks.len() as f32) > (grid_mgr.last_hashes.len() as f32 * 0.45) {
+                    // 全帧模式
+                    let encode_start = std::time::Instant::now();
                     
-                    let frame_flag: u8 = 0x02;
-                    
-                    // 非阻塞 try_send，通道满则丢弃
-                    if keyframe_tx.try_send(Message::Binary(
-                        build_binary_packet(frame_flag, 0, 0, screen_w as u16, screen_h as u16, &jpeg_bytes)
-                    )).is_err() {
-                        network_dropped = true;
-                    }
-                }
-            } else if !dirty_blocks.is_empty() {
-                // 增量模式：连通分量包围盒合并 + 批量消息（一次编码+发送，避免数百条独立消息）
-                let merged = grid_mgr.merge_connected_components(&dirty_blocks);
-                let mut batch_blocks_v2: Vec<(u16, u16, u16, u16, u8, Vec<u8>)> = Vec::with_capacity(merged.len());
-                for block in &merged {
-                    extract_block_rgba_into(&frame_data, block, screen_w, &mut block_buffer);
-                    let area = block.w as u32 * block.h as u32;
-                    if area < 128 * 128 {
-                        // 小块：使用原始 BGRA（避免 JPEG 编解码开销）
-                        frame_send_bytes += block_buffer.len();
-                        batch_blocks_v2.push((block.x, block.y, block.w, block.h, 1, block_buffer.clone()));
+                    let jpeg_result = if is_video {
+                        // 降采样 1/2，大幅降低 CPU 开销
+                        downsample_bgra_2x(&frame_data, screen_w, screen_h, &mut downsample_buffer);
+                        compressor.compress_to_vec(Image {
+                            pixels: &downsample_buffer, 
+                            width: screen_w / 2, 
+                            height: screen_h / 2, 
+                            pitch: (screen_w / 2) * 4, 
+                            format: PixelFormat::BGRA,
+                        })
                     } else {
-                        // 大块：继续使用 JPEG 编码
+                        compressor.compress_to_vec(Image {
+                            pixels: &frame_data, width: screen_w, height: screen_h, pitch: screen_w * 4, format: PixelFormat::BGRA,
+                        })
+                    };
+
+                    if let Ok(jpeg_bytes) = jpeg_result {
+                        encode_total_ms = encode_start.elapsed().as_millis() as u64;
+                        frame_send_bytes = jpeg_bytes.len();
+                        
+                        // flag 0x03 means 1/2 scaled full frame, 0x02 means full frame
+                        let frame_flag = if is_video { 0x03 } else { 0x02 };
+                        
+                        // 优化1: 非阻塞 try_send，通道满则丢弃
+                        if tx.try_send(Message::Binary(
+                            build_binary_packet(frame_flag, 0, 0, screen_w as u16, screen_h as u16, &jpeg_bytes)
+                        )).is_err() {
+                            network_dropped = true;
+                        }
+                    }
+                } else if !dirty_blocks.is_empty() {
+                    // 增量模式：连通分量包围盒合并（参照 VNC/X11 Damage 做法）
+                    let merged = grid_mgr.merge_connected_components(&dirty_blocks);
+                    for block in &merged {
+                        // 优化2: 复用 block_buffer，clear + 原地覆写
+                        extract_block_rgba_into(&frame_data, block, screen_w, &mut block_buffer);
                         let encode_start = std::time::Instant::now();
                         if let Ok(jpeg_bytes) = compressor.compress_to_vec(Image {
                             pixels: &block_buffer,
@@ -608,74 +398,49 @@ async fn main() {
                         }) {
                             encode_total_ms += encode_start.elapsed().as_millis() as u64;
                             frame_send_bytes += jpeg_bytes.len();
-                            batch_blocks_v2.push((block.x, block.y, block.w, block.h, 0, jpeg_bytes));
+
+                            // 优化1: 非阻塞发送
+                            if tx.try_send(Message::Binary(
+                                build_binary_packet(0x01, block.x, block.y, block.w, block.h, &jpeg_bytes)
+                            )).is_err() {
+                                network_dropped = true;
+                                break;
+                            }
                         }
                     }
                 }
-                if !batch_blocks_v2.is_empty() {
-                    // 转为切片引用构建批量包 v2
-                    let refs: Vec<(u16, u16, u16, u16, u8, &[u8])> = batch_blocks_v2.iter()
-                        .map(|(x, y, w, h, enc, data)| (*x, *y, *w, *h, *enc, data.as_slice()))
-                        .collect();
-                    if delta_tx.try_send(Message::Binary(build_batch_packet_v2(&refs))).is_err() {
-                        network_dropped = true;
-                    }
+
+                if network_dropped {
+                    grid_mgr.last_hashes.fill(0);
+                }
+
+                // 带宽统计
+                let now = std::time::Instant::now();
+                send_history.push_back((now, frame_send_bytes));
+                while send_history.front().map_or(false, |(t, _)| now.duration_since(*t).as_millis() > 1000) {
+                    send_history.pop_front();
+                }
+                let send_kbps = send_history.iter().map(|(_, b)| b).sum::<usize>() as f32 / 1024.0;
+                quality_engine.adapt(change_ratio, cpu_load, encode_total_ms, send_kbps);
+
+                if status_log_timer.elapsed().as_secs() >= 5 {
+                    quality_engine.log_status();
+                    println!("  CPU={:.0}% change={:.1}% blocks={} send={:.0}KB/s",
+                        cpu_load, change_ratio * 100.0, dirty_blocks.len(), send_kbps);
+                    status_log_timer = std::time::Instant::now();
                 }
             }
 
-            if network_dropped || capture_mode == CaptureMode::VideoFullFrame {
-                grid_mgr.last_hashes.fill(0);
+            let elapsed_ms = frame_start.elapsed().as_millis() as u64;
+            let target_ms = 1000 / quality_engine.framerate;
+            if elapsed_ms < target_ms {
+                // 因为在独立线程中，这里用标准的 std::thread::sleep 即可
+                std::thread::sleep(std::time::Duration::from_millis(target_ms - elapsed_ms));
             }
-
-            // === Cursor Pseudo-Encoding: 发送光标位置和形状变化 ===
-            unsafe {
-                let mut pt: POINT = std::mem::zeroed();
-                if GetCursorPos(&mut pt) != 0 {
-                    // 光标位置消息 (0x07): 每帧发送
-                    let mut cursor_msg = Vec::with_capacity(5);
-                    cursor_msg.push(0x07);
-                    cursor_msg.extend_from_slice(&(pt.x as u16).to_be_bytes());
-                    cursor_msg.extend_from_slice(&(pt.y as u16).to_be_bytes());
-                    let _ = delta_tx.try_send(Message::Binary(cursor_msg));
-
-                    // 光标形状变化消息 (0x08): 仅在类型变化时发送
-                    if let Some(cursor_type) = cursor_tracker.check_change() {
-                        let mut shape_msg = Vec::with_capacity(4);
-                        shape_msg.push(0x08);
-                        shape_msg.push(cursor_type);
-                        shape_msg.extend_from_slice(&0u16.to_be_bytes()); // png_len=0, 客户端根据类型使用系统光标
-                        let _ = delta_tx.try_send(Message::Binary(shape_msg));
-                    }
-                }
-            }
-
-            // 带宽统计
-            let now = std::time::Instant::now();
-            send_history.push_back((now, frame_send_bytes));
-            while send_history.front().map_or(false, |(t, _)| now.duration_since(*t).as_millis() > 1000) {
-                send_history.pop_front();
-            }
-            let send_kbps = send_history.iter().map(|(_, b)| b).sum::<usize>() as f32 / 1024.0;
-            quality_engine.adapt(change_ratio, cpu_load, encode_total_ms, send_kbps);
-
-            if status_log_timer.elapsed().as_secs() >= 5 {
-                quality_engine.log_status();
-                println!("  CPU={:.0}% change={:.1}% blocks={} send={:.0}KB/s",
-                    cpu_load, change_ratio * 100.0, dirty_blocks.len(), send_kbps);
-                status_log_timer = std::time::Instant::now();
-            }
-            } // closes else (xxhash not match → encode)
         }
+    });
 
-        // 固定帧间隔：消除帧间隔抖动
-        let target_interval_ms = match capture_mode {
-            CaptureMode::VideoFullFrame => 16,
-            CaptureMode::Balanced => 12,
-            CaptureMode::Incremental => 12,
-        };
-        let elapsed_ms = frame_start.elapsed().as_millis() as u64;
-        if elapsed_ms < target_interval_ms {
-            tokio::time::sleep(std::time::Duration::from_millis(target_interval_ms - elapsed_ms)).await;
-        }
-    }
+    // 阻塞主线程，保持 Tokio 运行时存活
+    tokio::signal::ctrl_c().await.unwrap();
+    println!("Agent shutting down...");
 }

@@ -6,14 +6,3 @@ coverage/
 *.log
 .env*
 !.env.example
-
-# Trae IDE internal
-.trae/
-
-# Rust build artifacts
-agent-rust/target/
-agent-rust/.device_id
-
-# Go build artifacts
-server-go/server.exe
-server-go/server
