@@ -47,12 +47,15 @@ pub fn build_binary_packet(
     h: u16,
     jpeg_bytes: &[u8],
 ) -> Vec<u8> {
-    let mut packet = Vec::with_capacity(9 + jpeg_bytes.len());
+    let mut packet = Vec::with_capacity(14 + jpeg_bytes.len());
     packet.push(frame_type);
     packet.extend_from_slice(&x.to_be_bytes());
     packet.extend_from_slice(&y.to_be_bytes());
     packet.extend_from_slice(&w.to_be_bytes());
     packet.extend_from_slice(&h.to_be_bytes());
+    let jpeg_len = jpeg_bytes.len() as u32;
+    packet.extend_from_slice(&jpeg_len.to_be_bytes());
+    packet.push(0);
     packet.extend_from_slice(jpeg_bytes);
     packet
 }

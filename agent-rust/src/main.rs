@@ -1,6 +1,7 @@
 mod dirty_rect;
 mod capture;
 mod encoder;
+mod config;
 
 use capture::ScreenCapturer;
 use dirty_rect::GridManager;
@@ -44,13 +45,13 @@ struct QualityEngine {
 impl QualityEngine {
     fn new() -> Self {
         Self {
-            quality: 75,
-            min_quality: 30,
+            quality: 95,
+            min_quality: 85,
             max_quality: 95,
             framerate: 30,
             keyframe_interval: 60,
             frame_count: 0,
-            target_rate_kbps: 50000.0,
+            target_rate_kbps: 150000.0,
             avg_encode_ms: 0.0,
             avg_send_kbps: 0.0,
         }
@@ -62,42 +63,36 @@ impl QualityEngine {
         self.avg_encode_ms = self.avg_encode_ms * 0.7 + encode_ms as f32 * 0.3;
         self.avg_send_kbps = self.avg_send_kbps * 0.7 + send_kbps * 0.3;
 
-        // 动态帧率与画质权衡 (视频模式保帧率降画质，静态模式保画质降帧率)
         if change_ratio > 0.40 {
-            // 大面积变化 (视频播放)：降低最高帧率至 30 FPS 以保护 CPU，画质保持及格线
             self.framerate = 30;
-            self.quality = (self.quality - 8).max(50);
+            self.quality = (self.quality - 2).max(80);
         } else if change_ratio > 0.15 {
-            self.framerate = 20;
-            self.quality = (self.quality - 3).max(65);
+            self.framerate = 30;
+            self.quality = (self.quality - 1).max(80);
         } else if change_ratio > 0.02 {
-            self.framerate = 15;
-            self.quality = (self.quality + 2).min(80);
+            self.framerate = 30;
+            self.quality = (self.quality + 1).min(self.max_quality);
         } else {
-            // 静态画面 (文本阅读)：极低帧率，最高画质 (完美清晰)
-            self.framerate = 5;
-            self.quality = (self.quality + 5).min(self.max_quality);
+            self.framerate = 30;
+            self.quality = (self.quality + 2).min(self.max_quality);
         }
 
-        // 带宽熔断（优先级最高）
-        if send_kbps > self.target_rate_kbps * 0.85 {
-            self.framerate = self.framerate.min(8);
-            self.quality = (self.quality - 12).max(self.min_quality);
-        } else if send_kbps > self.target_rate_kbps * 0.6 {
+        if send_kbps > self.target_rate_kbps * 0.90 {
             self.framerate = self.framerate.min(15);
-            self.quality = (self.quality - 6).max(self.min_quality);
+            self.quality = (self.quality - 3).max(self.min_quality);
+        } else if send_kbps > self.target_rate_kbps * 0.75 {
+            self.framerate = self.framerate.min(24);
+            self.quality = (self.quality - 1).max(self.min_quality);
         }
 
-        // CPU 熔断
-        if cpu_load > 80.0 {
-            self.framerate = self.framerate.min(8);
-            self.quality = (self.quality - 10).max(self.min_quality);
-        } else if cpu_load > 60.0 {
+        if cpu_load > 90.0 {
             self.framerate = self.framerate.min(15);
-            self.quality = (self.quality - 5).max(self.min_quality);
+            self.quality = (self.quality - 3).max(self.min_quality);
+        } else if cpu_load > 75.0 {
+            self.framerate = self.framerate.min(24);
+            self.quality = (self.quality - 1).max(self.min_quality);
         }
 
-        // 编码耗时调整
         if self.avg_encode_ms > 50.0 {
             self.quality = (self.quality - 8).max(self.min_quality);
         } else if self.avg_encode_ms < 15.0 && change_ratio < 0.10 {
@@ -110,7 +105,6 @@ impl QualityEngine {
             self.quality = (self.quality - 5).max(self.min_quality);
         }
 
-        // 防御性兜底：绝不出现 framerate=0 导致除零 panic
         self.framerate = self.framerate.max(1);
     }
 
@@ -154,6 +148,98 @@ fn map_key(key_str: &str) -> Option<Key> {
         "F7" => Some(Key::F7), "F8" => Some(Key::F8), "F9" => Some(Key::F9),
         "F10" => Some(Key::F10), "F11" => Some(Key::F11), "F12" => Some(Key::F12),
         _ => None,
+    }
+}
+
+fn vk_to_key(vk: u16) -> Option<Key> {
+    match vk {
+        0x41..=0x5A => Some(Key::Layout((b'A' + (vk - 0x41) as u8) as char)),
+        0x30..=0x39 => Some(Key::Layout((b'0' + (vk - 0x30) as u8) as char)),
+        0x08 => Some(Key::Backspace),
+        0x09 => Some(Key::Tab),
+        0x0D => Some(Key::Return),
+        0x10 | 0xA0 | 0xA1 => Some(Key::Shift),
+        0x11 | 0xA2 | 0xA3 => Some(Key::Control),
+        0x12 | 0xA4 | 0xA5 => Some(Key::Alt),
+        0x5B | 0x5C => Some(Key::Meta),
+        0x1B => Some(Key::Escape),
+        0x20 => Some(Key::Space),
+        0x21 => Some(Key::PageUp),
+        0x22 => Some(Key::PageDown),
+        0x23 => Some(Key::End),
+        0x24 => Some(Key::Home),
+        0x25 => Some(Key::LeftArrow),
+        0x26 => Some(Key::UpArrow),
+        0x27 => Some(Key::RightArrow),
+        0x28 => Some(Key::DownArrow),
+        0x2D => Some(Key::Insert),
+        0x2E => Some(Key::Delete),
+        0x14 => Some(Key::CapsLock),
+        0x70 => Some(Key::F1), 0x71 => Some(Key::F2), 0x72 => Some(Key::F3),
+        0x73 => Some(Key::F4), 0x74 => Some(Key::F5), 0x75 => Some(Key::F6),
+        0x76 => Some(Key::F7), 0x77 => Some(Key::F8), 0x78 => Some(Key::F9),
+        0x79 => Some(Key::F10), 0x7A => Some(Key::F11), 0x7B => Some(Key::F12),
+        _ => None,
+    }
+}
+
+fn handle_binary_msg(enigo: &mut Enigo, data: &[u8]) {
+    if data.is_empty() { return; }
+    match data[0] {
+        0x01 => {
+            if data.len() < 6 { return; }
+            let x = data[2] as i32 | ((data[3] as i32) << 8);
+            let y = data[4] as i32 | ((data[5] as i32) << 8);
+            enigo.mouse_move_to(x, y);
+        }
+        0x02 => {
+            if data.len() < 3 { return; }
+            let button = match data[1] {
+                0 => MouseButton::Left,
+                1 => MouseButton::Right,
+                2 => MouseButton::Middle,
+                _ => return,
+            };
+            if data[2] == 1 {
+                enigo.mouse_down(button);
+            } else {
+                enigo.mouse_up(button);
+            }
+        }
+        0x03 => {
+            if data.len() < 4 { return; }
+            let delta = (data[2] as i16) | ((data[3] as i16) << 8);
+            enigo.mouse_scroll_y(delta as i32);
+        }
+        0x04 => {
+            if data.len() < 2 { return; }
+            let count = data[1] as usize;
+            let mut offset = 2;
+            for _ in 0..count {
+                if offset + 3 > data.len() { break; }
+                let action = data[offset];
+                let vk = data[offset + 1] as u16 | ((data[offset + 2] as u16) << 8);
+                offset += 3;
+                if let Some(key) = vk_to_key(vk) {
+                    if action == 0 {
+                        enigo.key_down(key);
+                    } else {
+                        enigo.key_up(key);
+                    }
+                }
+            }
+        }
+        0x05 => {
+            if data.len() < 2 { return; }
+            if data[1] == 10 {
+                enigo.key_down(Key::Control);
+                enigo.key_down(Key::Alt);
+                enigo.key_click(Key::Delete);
+                enigo.key_up(Key::Alt);
+                enigo.key_up(Key::Control);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -204,7 +290,7 @@ async fn main() {
     let mem_gb = (sys.total_memory() as f64 / 1_073_741_824.0).round() as u64;
     
     let mut mac_addr = String::new();
-    let networks = sysinfo::Networks::new_with_sysinfo();
+    let networks = sysinfo::Networks::new_with_refreshed_list();
     for (name, data) in &networks {
         if name != "lo" && !name.starts_with("Loopback") {
             mac_addr = format!("{:?}", data.mac_address());
@@ -218,8 +304,16 @@ async fn main() {
     let cpu_brand_encoded = cpu_brand.replace(" ", "%20");
     let mac_encoded = mac_addr.replace(" ", "%20");
 
-    let url = format!("ws://127.0.0.1:38921/agent/register?device_id={}&device_name={}&os={}&cpu={}&ram={}GB&mac={}", 
-        device_id, host_name_encoded, os_name_encoded, cpu_brand_encoded, mem_gb, mac_encoded);
+    let server_url = config::resolve_server_url();
+    let host_port = server_url
+        .strip_prefix("ws://")
+        .or_else(|| server_url.strip_prefix("wss://"))
+        .unwrap_or(&server_url)
+        .to_string();
+    let host_port = host_port.split('/').next().unwrap_or(&host_port).to_string();
+
+    let url = format!("{}/agent/register?device_id={}&device_name={}&os={}&cpu={}&ram={}GB&mac={}", 
+        server_url.trim_end_matches('/'), device_id, host_name_encoded, os_name_encoded, cpu_brand_encoded, mem_gb, mac_encoded);
 
     println!("Connecting to hub at {}", url);
     let (ws_stream, _) = tokio_tungstenite::connect_async(url).await.expect("Failed to connect");
@@ -258,7 +352,11 @@ async fn main() {
     tokio::spawn(async move {
         let mut enigo = Enigo::new();
         while let Some(msg) = read.next().await {
-            if let Ok(Message::Text(text)) = msg {
+            match msg {
+                Ok(Message::Binary(data)) => {
+                    handle_binary_msg(&mut enigo, &data);
+                }
+                Ok(Message::Text(text)) => {
                 if let Ok(cmd) = serde_json::from_str::<ControlCmd>(&text) {
                     match cmd.action.as_str() {
                         "mouse_move" => {
@@ -315,6 +413,8 @@ async fn main() {
                         _ => {}
                     }
                 }
+                }
+                _ => {}
             }
         }
     });

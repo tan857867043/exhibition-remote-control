@@ -6,6 +6,8 @@ pub struct ScreenCapturer {
     pub height: usize,
 }
 
+unsafe impl Send for ScreenCapturer {}
+
 impl ScreenCapturer {
     pub fn new() -> Self {
         let display_result = Display::primary();

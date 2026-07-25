@@ -56,12 +56,14 @@ class ExhibitionRemoteClient {
     constructor(canvas, serverUrl, deviceId, onStats) {
         this.canvas = canvas;
         this.ctx = canvas.getContext('2d', { alpha: false });
+        this.ctx.imageSmoothingEnabled = false;
         this.serverUrl = serverUrl;
         this.deviceId = deviceId;
         this.onStats = onStats;
 
         this.offscreenCanvas = document.createElement('canvas');
         this.offscreenCtx = this.offscreenCanvas.getContext('2d', { alpha: false });
+        this.offscreenCtx.imageSmoothingEnabled = false;
 
         this.maxFullW = this.canvas.width || 1920;
         this.maxFullH = this.canvas.height || 1080;
@@ -74,6 +76,7 @@ class ExhibitionRemoteClient {
         this.keyBatch = [];
         this.keyBatchTimer = null;
         this.currentCursorType = 0;
+        this._useImageDecoder = typeof ImageDecoder !== 'undefined';
 
         // Window-level handlers to preserve drag state outside canvas bounds
         this._onMouseMove = (e) => this.sendMouseEvent(e);
@@ -145,14 +148,16 @@ class ExhibitionRemoteClient {
                     if(w !== this.offscreenCanvas.width || h !== this.offscreenCanvas.height) {
                         this.offscreenCanvas.width = w;
                         this.offscreenCanvas.height = h;
+                        this.offscreenCtx.imageSmoothingEnabled = false;
                         this.canvas.width = w;
                         this.canvas.height = h;
+                        this.ctx.imageSmoothingEnabled = false;
                         this.maxFullW = w;
                         this.maxFullH = h;
                     }
                 }
                 
-                tasks.push(createImageBitmap(new Blob([jpegData])).then(bitmap => ({bitmap, x, y, w, h, frameType})));
+                tasks.push(this._decodeJpeg(jpegData).then(bitmap => ({bitmap, x, y, w, h, frameType})));
                 offset += regionSize;
             }
 
@@ -181,6 +186,19 @@ class ExhibitionRemoteClient {
         this.ws.onclose = () => {
             console.log("Disconnected from device stream");
         };
+    }
+
+    async _decodeJpeg(jpegData) {
+        if (this._useImageDecoder) {
+            try {
+                const decoder = new ImageDecoder({ data: jpegData, type: 'image/jpeg' });
+                const result = await decoder.decode();
+                return result.image;
+            } catch (e) {
+                this._useImageDecoder = false;
+            }
+        }
+        return await createImageBitmap(new Blob([jpegData]));
     }
 
     updateCursorStyle() {
