@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import ExhibitionRemoteClient from "./lib/ExhibitionRemoteClient.js";
-import { Monitor, WifiOff, Settings, Mouse, Cast, Lock, Terminal, Router, X, Maximize, Minimize, ChevronLeft, Zap, Image as ImageIcon, Activity } from "lucide-react";
+import { Monitor, WifiOff, Settings, Mouse, Cast, Lock, Terminal, Router, X, Maximize, Minimize, ChevronLeft, Zap, Image as ImageIcon, Activity, Download } from "lucide-react";
 
 interface DeviceInfo {
   id: string;
@@ -67,6 +67,22 @@ export default function App() {
       console.error(e);
       setStatus("disconnected");
       setDevices([]);
+    }
+  };
+
+  const handleDownloadAgent = async () => {
+    try {
+      const res = await fetch(`${serverUrl}/agents`);
+      if (!res.ok) throw new Error('下载失败');
+      const blob = await res.blob();
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'exhibition-agent.exe';
+      a.click();
+      URL.revokeObjectURL(a.href);
+    } catch (e) {
+      console.error(e);
+      alert('Agent 下载失败，请确认服务端已编译 Agent');
     }
   };
 
@@ -313,6 +329,9 @@ export default function App() {
               />
               <button onClick={loadDevices} className="px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg hover:bg-slate-700 text-sm font-bold transition-all text-slate-200 shadow-sm flex items-center gap-2">
                 <Router className="w-4 h-4" /> 刷新
+              </button>
+              <button onClick={handleDownloadAgent} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 border border-indigo-500/50 rounded-lg text-sm font-bold transition-all text-white shadow-sm flex items-center gap-2 shadow-[0_0_12px_rgba(99,102,241,0.25)]">
+                <Download className="w-4 h-4" /> 下载 Agent
               </button>
             </div>
           </header>

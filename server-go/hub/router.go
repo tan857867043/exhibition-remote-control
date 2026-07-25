@@ -1,10 +1,14 @@
 package hub
 
 import (
+	"encoding/binary"
 	"encoding/json"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -12,6 +16,37 @@ import (
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+var exeConfigGUID = []byte{0xB9, 0x96, 0x01, 0x58, 0x80, 0x54, 0x4A, 0x19, 0xB7, 0xF7, 0xE9, 0xBE, 0x44, 0x91, 0x4C, 0x18}
+
+func getLocalIP() string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "127.0.0.1"
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip != nil && ip.To4() != nil {
+				return ip.String()
+			}
+		}
+	}
+	return "127.0.0.1"
 }
 
 func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
@@ -36,6 +71,8 @@ func InitRouter() {
 	http.HandleFunc("/api/v1/devices/thumbnail", corsMiddleware(handleThumbnail))
 	http.HandleFunc("/api/v1/stream", handleStreamSubscribe)
 	http.HandleFunc("/api/v1/control", corsMiddleware(handleExternalControl))
+
+	http.HandleFunc("/agents", corsMiddleware(handleAgentDownload))
 }
 
 // 接收 Rust Agent 的画面数据并高效流式分发给所有第三方订阅者
@@ -260,14 +297,67 @@ func handleStreamSubscribe(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 
-		// 将客户端发来的 WebSocket 文本消息（控制指令）透传给 Agent，降低控制延迟
-		if messageType == websocket.TextMessage {
+		if messageType == websocket.TextMessage || messageType == websocket.BinaryMessage {
 			GlobalHub.mu.RLock()
 			agentConn, exists := GlobalHub.Agents[deviceID]
 			GlobalHub.mu.RUnlock()
 			if exists {
-				agentConn.WriteMessage(websocket.TextMessage, payload)
+				agentConn.WriteMessage(messageType, payload)
 			}
 		}
 	}
+}
+
+func handleAgentDownload(w http.ResponseWriter, r *http.Request) {
+	exePath := filepath.Join("..", "agent-rust", "target", "release", "exhibition-agent.exe")
+	if _, err := os.Stat(exePath); os.IsNotExist(err) {
+		exePath = filepath.Join("..", "agent-rust", "target", "debug", "exhibition-agent.exe")
+		if _, err := os.Stat(exePath); os.IsNotExist(err) {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+	}
+
+	host := r.URL.Query().Get("server")
+	if host == "" {
+		host = r.Host
+	}
+	port := "38921"
+	if h, p, err := net.SplitHostPort(host); err == nil {
+		host = h
+		port = p
+	}
+	if host == "localhost" || host == "127.0.0.1" || host == "" {
+		host = getLocalIP()
+	}
+	host = net.JoinHostPort(host, port)
+
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	serverURL := scheme + "://" + host
+
+	cfg := map[string]string{"server_url": serverURL}
+	if deviceName := r.URL.Query().Get("device_name"); deviceName != "" {
+		cfg["device_name"] = deviceName
+	}
+	configJSON, _ := json.Marshal(cfg)
+
+	exeFile, err := os.Open(exePath)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer exeFile.Close()
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", `attachment; filename="exhibition-agent.exe"`)
+
+	io.Copy(w, exeFile)
+	w.Write(configJSON)
+	lenBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(lenBuf, uint32(len(configJSON)))
+	w.Write(lenBuf)
+	w.Write(exeConfigGUID)
 }

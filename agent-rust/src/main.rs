@@ -1,6 +1,7 @@
 mod dirty_rect;
 mod capture;
 mod encoder;
+mod config;
 
 use capture::ScreenCapturer;
 use dirty_rect::GridManager;
@@ -169,6 +170,98 @@ fn map_key(key_str: &str) -> Option<Key> {
     }
 }
 
+fn vk_to_key(vk: u16) -> Option<Key> {
+    match vk {
+        0x41..=0x5A => Some(Key::Layout((b'A' + (vk - 0x41) as u8) as char)),
+        0x30..=0x39 => Some(Key::Layout((b'0' + (vk - 0x30) as u8) as char)),
+        0x08 => Some(Key::Backspace),
+        0x09 => Some(Key::Tab),
+        0x0D => Some(Key::Return),
+        0x10 | 0xA0 | 0xA1 => Some(Key::Shift),
+        0x11 | 0xA2 | 0xA3 => Some(Key::Control),
+        0x12 | 0xA4 | 0xA5 => Some(Key::Alt),
+        0x5B | 0x5C => Some(Key::Meta),
+        0x1B => Some(Key::Escape),
+        0x20 => Some(Key::Space),
+        0x21 => Some(Key::PageUp),
+        0x22 => Some(Key::PageDown),
+        0x23 => Some(Key::End),
+        0x24 => Some(Key::Home),
+        0x25 => Some(Key::LeftArrow),
+        0x26 => Some(Key::UpArrow),
+        0x27 => Some(Key::RightArrow),
+        0x28 => Some(Key::DownArrow),
+        0x2D => Some(Key::Insert),
+        0x2E => Some(Key::Delete),
+        0x14 => Some(Key::CapsLock),
+        0x70 => Some(Key::F1), 0x71 => Some(Key::F2), 0x72 => Some(Key::F3),
+        0x73 => Some(Key::F4), 0x74 => Some(Key::F5), 0x75 => Some(Key::F6),
+        0x76 => Some(Key::F7), 0x77 => Some(Key::F8), 0x78 => Some(Key::F9),
+        0x79 => Some(Key::F10), 0x7A => Some(Key::F11), 0x7B => Some(Key::F12),
+        _ => None,
+    }
+}
+
+fn handle_binary_msg(enigo: &mut Enigo, data: &[u8]) {
+    if data.is_empty() { return; }
+    match data[0] {
+        0x01 => {
+            if data.len() < 6 { return; }
+            let x = data[2] as i32 | ((data[3] as i32) << 8);
+            let y = data[4] as i32 | ((data[5] as i32) << 8);
+            enigo.mouse_move_to(x, y);
+        }
+        0x02 => {
+            if data.len() < 3 { return; }
+            let button = match data[1] {
+                0 => MouseButton::Left,
+                1 => MouseButton::Right,
+                2 => MouseButton::Middle,
+                _ => return,
+            };
+            if data[2] == 1 {
+                enigo.mouse_down(button);
+            } else {
+                enigo.mouse_up(button);
+            }
+        }
+        0x03 => {
+            if data.len() < 4 { return; }
+            let delta = (data[2] as i16) | ((data[3] as i16) << 8);
+            enigo.mouse_scroll_y(delta as i32);
+        }
+        0x04 => {
+            if data.len() < 2 { return; }
+            let count = data[1] as usize;
+            let mut offset = 2;
+            for _ in 0..count {
+                if offset + 3 > data.len() { break; }
+                let action = data[offset];
+                let vk = data[offset + 1] as u16 | ((data[offset + 2] as u16) << 8);
+                offset += 3;
+                if let Some(key) = vk_to_key(vk) {
+                    if action == 0 {
+                        enigo.key_down(key);
+                    } else {
+                        enigo.key_up(key);
+                    }
+                }
+            }
+        }
+        0x05 => {
+            if data.len() < 2 { return; }
+            if data[1] == 10 {
+                enigo.key_down(Key::Control);
+                enigo.key_down(Key::Alt);
+                enigo.key_click(Key::Delete);
+                enigo.key_up(Key::Alt);
+                enigo.key_up(Key::Control);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// 计算 CPU 平均使用率
 fn cpus_avg(sys: &System) -> f32 {
     let cpus = sys.cpus();
@@ -218,6 +311,53 @@ impl CursorShapeTracker {
 async fn main() {
     println!("Exhibition Agent starting (industry-grade pipeline)...");
 
+    let server_url = config::resolve_server_url();
+    let host_port = server_url
+        .strip_prefix("ws://")
+        .or_else(|| server_url.strip_prefix("wss://"))
+        .unwrap_or(&server_url)
+        .to_string();
+    let host_port = host_port.split('/').next().unwrap_or(&host_port).to_string();
+
+    let device_id = std::fs::read_to_string(".device_id").unwrap_or_else(|_| {
+        let mut sys = System::new_all();
+        sys.refresh_all();
+        let host = System::host_name().unwrap_or_else(|| "UnknownHost".to_string());
+        let new_id = format!("{}_{}_{}", host, std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+        let hash = crc32fast::hash(new_id.as_bytes());
+        let id_str = format!("{:08x}", hash);
+        let _ = std::fs::write(".device_id", &id_str);
+        id_str
+    }).trim().to_string();
+
+    let mut sys = System::new_all();
+    sys.refresh_all();
+    let host_name = System::host_name().unwrap_or_else(|| "Unknown Device".to_string());
+    let os_name = format!("{} {}", System::name().unwrap_or_else(|| "Unknown OS".to_string()), System::os_version().unwrap_or_default());
+
+    let cpu_brand = sys.cpus().first().map(|c| c.brand()).unwrap_or("Unknown CPU").to_string();
+    let mem_gb = (sys.total_memory() as f64 / 1_073_741_824.0).round() as u64;
+
+    let mut mac_addr = String::new();
+    let networks = sysinfo::Networks::new_with_refreshed_list();
+    for (name, data) in &networks {
+        if name != "lo" && !name.starts_with("Loopback") {
+            mac_addr = format!("{:?}", data.mac_address());
+            break;
+        }
+    }
+
+    let host_name_encoded = host_name.replace(" ", "%20");
+    let os_name_encoded = os_name.replace(" ", "%20");
+    let cpu_brand_encoded = cpu_brand.replace(" ", "%20");
+    let mac_encoded = mac_addr.replace(" ", "%20");
+
+    let base_url = server_url.trim_end_matches('/');
+    let url = format!("{}/agent/register?device_id={}&device_name={}&os={}&cpu={}&ram={}GB&mac={}",
+        base_url, device_id, host_name_encoded, os_name_encoded, cpu_brand_encoded, mem_gb, mac_encoded);
+
+    println!("Connecting to hub at {}", url);
+
     let mut capturer = ScreenCapturer::new();
     let screen_w = capturer.width;
     let screen_h = capturer.height;
@@ -234,49 +374,7 @@ async fn main() {
     let mut dirty_history: VecDeque<f32> = VecDeque::with_capacity(4);
     let prev_hash_arc = Arc::new(tokio::sync::Mutex::new(None::<u64>));
 
-    // Generate or load Device ID
-    let device_id = std::fs::read_to_string(".device_id").unwrap_or_else(|_| {
-        let mut sys = System::new_all();
-        sys.refresh_all();
-        let host = System::host_name().unwrap_or_else(|| "UnknownHost".to_string());
-        let new_id = format!("{}_{}_{}", host, std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
-        // Simple hash to make it look like an ID
-        let hash = crc32fast::hash(new_id.as_bytes());
-        let id_str = format!("{:08x}", hash);
-        let _ = std::fs::write(".device_id", &id_str);
-        id_str
-    }).trim().to_string();
-
-    let mut sys = System::new_all();
-    sys.refresh_all();
-    let host_name = System::host_name().unwrap_or_else(|| "Unknown Device".to_string());
-    let os_name = format!("{} {}", System::name().unwrap_or_else(|| "Unknown OS".to_string()), System::os_version().unwrap_or_default());
-    
-    let cpu_brand = sys.cpus().first().map(|c| c.brand()).unwrap_or("Unknown CPU").to_string();
-    let mem_gb = (sys.total_memory() as f64 / 1_073_741_824.0).round() as u64;
-    
-    let mut mac_addr = String::new();
-    let networks = sysinfo::Networks::new_with_refreshed_list();
-    for (name, data) in &networks {
-        if name != "lo" && !name.starts_with("Loopback") {
-            mac_addr = format!("{:?}", data.mac_address());
-            break;
-        }
-    }
-
-    // URL encode strings
-    let host_name_encoded = host_name.replace(" ", "%20");
-    let os_name_encoded = os_name.replace(" ", "%20");
-    let cpu_brand_encoded = cpu_brand.replace(" ", "%20");
-    let mac_encoded = mac_addr.replace(" ", "%20");
-
-    let url = format!("ws://127.0.0.1:38921/agent/register?device_id={}&device_name={}&os={}&cpu={}&ram={}GB&mac={}", 
-        device_id, host_name_encoded, os_name_encoded, cpu_brand_encoded, mem_gb, mac_encoded);
-
-    println!("Connecting to hub at {}", url);
-
-    // 手动建立 TCP 连接以在握手前设置 NoDelay
-    let tcp = tokio::net::TcpStream::connect("127.0.0.1:38921").await.expect("Failed to connect");
+    let tcp = tokio::net::TcpStream::connect(&host_port).await.expect("Failed to connect");
     let _ = tcp.set_nodelay(true);
     let (ws_stream, _) = tokio_tungstenite::client_async(url, tcp).await.expect("Failed to connect");
 
@@ -329,7 +427,11 @@ async fn main() {
     tokio::spawn(async move {
         let mut enigo = Enigo::new();
         while let Some(msg) = read.next().await {
-            if let Ok(Message::Text(text)) = msg {
+            match msg {
+                Ok(Message::Binary(data)) => {
+                    handle_binary_msg(&mut enigo, &data);
+                }
+                Ok(Message::Text(text)) => {
                 if let Ok(cmd) = serde_json::from_str::<ControlCmd>(&text) {
                     match cmd.action.as_str() {
                         "mouse_move" => {
@@ -386,6 +488,8 @@ async fn main() {
                         _ => {}
                     }
                 }
+                }
+                _ => {}
             }
         }
     });
