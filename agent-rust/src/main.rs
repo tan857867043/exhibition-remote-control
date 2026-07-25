@@ -4,7 +4,7 @@ mod encoder;
 
 use capture::ScreenCapturer;
 use dirty_rect::GridManager;
-use encoder::{build_binary_packet, build_batch_packet_v2, extract_block_rgba_into, downsample_bgra_2x};
+use encoder::{build_binary_packet, build_batch_packet_v2, extract_block_rgba_into};
 use winapi::um::winuser::{GetCursorPos, GetCursor, LoadCursorW};
 use winapi::shared::windef::POINT;
 use enigo::{Enigo, MouseControllable, MouseButton, KeyboardControllable, Key};
@@ -51,13 +51,13 @@ struct QualityEngine {
 impl QualityEngine {
     fn new() -> Self {
         Self {
-            quality: 75,
-            min_quality: 30,
+            quality: 95,
+            min_quality: 85,
             max_quality: 95,
             framerate: 30,
             keyframe_interval: 60,
             frame_count: 0,
-            target_rate_kbps: 50000.0,
+            target_rate_kbps: 150000.0,
             avg_encode_ms: 0.0,
             avg_send_kbps: 0.0,
         }
@@ -71,37 +71,35 @@ impl QualityEngine {
 
         // 动态帧率与画质权衡 (视频模式保帧率降画质，静态模式保画质降帧率)
         if change_ratio > 0.40 {
-            // 大面积变化 (视频播放)：降低最高帧率至 30 FPS 以保护 CPU，画质保持及格线
             self.framerate = 30;
-            self.quality = (self.quality - 8).max(50);
+            self.quality = (self.quality - 2).max(80);
         } else if change_ratio > 0.15 {
-            self.framerate = 20;
-            self.quality = (self.quality - 3).max(65);
+            self.framerate = 30;
+            self.quality = (self.quality - 1).max(80);
         } else if change_ratio > 0.02 {
-            self.framerate = 15;
-            self.quality = (self.quality + 2).min(80);
+            self.framerate = 30;
+            self.quality = (self.quality + 1).min(self.max_quality);
         } else {
-            // 静态画面 (文本阅读)：极低帧率，最高画质 (完美清晰)
-            self.framerate = 5;
-            self.quality = (self.quality + 5).min(self.max_quality);
+            self.framerate = 30;
+            self.quality = (self.quality + 2).min(self.max_quality);
         }
 
         // 带宽熔断（优先级最高）
-        if send_kbps > self.target_rate_kbps * 0.85 {
-            self.framerate = self.framerate.min(8);
-            self.quality = (self.quality - 12).max(self.min_quality);
-        } else if send_kbps > self.target_rate_kbps * 0.6 {
+        if send_kbps > self.target_rate_kbps * 0.90 {
             self.framerate = self.framerate.min(15);
-            self.quality = (self.quality - 6).max(self.min_quality);
+            self.quality = (self.quality - 3).max(self.min_quality);
+        } else if send_kbps > self.target_rate_kbps * 0.75 {
+            self.framerate = self.framerate.min(24);
+            self.quality = (self.quality - 1).max(self.min_quality);
         }
 
         // CPU 熔断
-        if cpu_load > 80.0 {
-            self.framerate = self.framerate.min(8);
-            self.quality = (self.quality - 10).max(self.min_quality);
-        } else if cpu_load > 60.0 {
+        if cpu_load > 90.0 {
             self.framerate = self.framerate.min(15);
-            self.quality = (self.quality - 5).max(self.min_quality);
+            self.quality = (self.quality - 3).max(self.min_quality);
+        } else if cpu_load > 75.0 {
+            self.framerate = self.framerate.min(24);
+            self.quality = (self.quality - 1).max(self.min_quality);
         }
 
         // 编码耗时调整
@@ -394,23 +392,25 @@ async fn main() {
 
     // === 预分配可复用 buffer，避免高频 malloc ===
     let mut block_buffer: Vec<u8> = Vec::with_capacity(grid_size * grid_size * 4);
-    let mut downsample_buffer: Vec<u8> = Vec::with_capacity(screen_w * screen_h); // (w/2 * h/2 * 4)
 
     // === Cursor Pseudo-Encoding: 初始化光标跟踪器 ===
     let mut cursor_tracker = CursorShapeTracker::new();
 
+    let mut frame_counter: u64 = 0;
+    const FORCE_FRAME_INTERVAL: u64 = 6;
+
     // 主循环：捕获→检测→自适应→编码→非阻塞发送（MPSC try_send 解耦网络 I/O）
     loop {
         let frame_start = std::time::Instant::now();
+        frame_counter = frame_counter.wrapping_add(1);
+        let force_send = frame_counter % FORCE_FRAME_INTERVAL == 0;
 
         if let Some(frame_data) = capturer.capture_frame() {
-            // Fast pre-check: skip tile diff on static frames using xxhash
             let frame_hash = xxh64(&frame_data, 0);
             let mut ph = prev_hash_arc.lock().await;
-            if *ph == Some(frame_hash) {
+            let is_static = *ph == Some(frame_hash) && !force_send;
+            if is_static {
                 drop(ph);
-                // 静态帧：跳过编码传输，但保留帧间隔控制（不continue）
-                // 让 frame_start 正确流逝，避免画面变化后出现长时间空白
             } else {
             *ph = Some(frame_hash);
             drop(ph);
@@ -445,12 +445,11 @@ async fn main() {
             let force_key = quality_engine.need_keyframe();
 
             if is_video {
-                compressor.set_quality(65);  // 视频模式固定 Q=65
+                compressor.set_quality(85);
             } else {
                 compressor.set_quality(quality_engine.quality);
             }
-            // 视频模式强制 4:2:0 subsamp
-            compressor.set_subsamp(if is_video { turbojpeg::Subsamp::Sub2x2 } else { turbojpeg::Subsamp::None });
+            compressor.set_subsamp(turbojpeg::Subsamp::None);
 
             let mut frame_send_bytes = 0usize;
             let mut encode_total_ms = 0u64;
@@ -458,35 +457,22 @@ async fn main() {
 
             // 视频/高变化场景优先发全帧（客户端单张 JPEG 解码比数百块快 10x 以上）
             // 平衡模式也发全帧 → 避免前端逐个解码百个小块（每个块独立 createImageBitmap）
-            let full_frame_threshold = if is_video { 0.05 } else { 0.20 };
-            let should_full_frame = is_video || force_key || capture_mode == CaptureMode::Balanced
+            let full_frame_threshold = if is_video { 0.30 } else { 0.40 };
+            let should_full_frame = is_video || force_key
                 || (dirty_blocks.len() as f32) > (grid_mgr.last_hashes.len() as f32 * full_frame_threshold);
             if should_full_frame {
                 // 全帧模式
                 let encode_start = std::time::Instant::now();
                 
-                let jpeg_result = if is_video {
-                    // 降采样 1/2，大幅降低 CPU 开销
-                    downsample_bgra_2x(&frame_data, screen_w, screen_h, &mut downsample_buffer);
-                    compressor.compress_to_vec(Image {
-                        pixels: &downsample_buffer, 
-                        width: screen_w / 2, 
-                        height: screen_h / 2, 
-                        pitch: (screen_w / 2) * 4, 
-                        format: PixelFormat::BGRA,
-                    })
-                } else {
-                    compressor.compress_to_vec(Image {
-                        pixels: &frame_data, width: screen_w, height: screen_h, pitch: screen_w * 4, format: PixelFormat::BGRA,
-                    })
-                };
+                let jpeg_result = compressor.compress_to_vec(Image {
+                    pixels: &frame_data, width: screen_w, height: screen_h, pitch: screen_w * 4, format: PixelFormat::BGRA,
+                });
 
                 if let Ok(jpeg_bytes) = jpeg_result {
                     encode_total_ms = encode_start.elapsed().as_millis() as u64;
                     frame_send_bytes = jpeg_bytes.len();
                     
-                    // flag 0x03 means 1/2 scaled full frame, 0x02 means full frame
-                    let frame_flag = if is_video { 0x03 } else { 0x02 };
+                    let frame_flag: u8 = 0x02;
                     
                     // 非阻塞 try_send，通道满则丢弃
                     if keyframe_tx.try_send(Message::Binary(
@@ -579,9 +565,9 @@ async fn main() {
 
         // 固定帧间隔：消除帧间隔抖动
         let target_interval_ms = match capture_mode {
-            CaptureMode::VideoFullFrame => 30,   // ~33 FPS
-            CaptureMode::Balanced => 30,          // ~33 FPS
-            CaptureMode::Incremental => 40,       // 25 FPS
+            CaptureMode::VideoFullFrame => 16,
+            CaptureMode::Balanced => 12,
+            CaptureMode::Incremental => 12,
         };
         let elapsed_ms = frame_start.elapsed().as_millis() as u64;
         if elapsed_ms < target_interval_ms {

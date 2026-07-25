@@ -6,3 +6,11 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Rust build artifacts
+agent-rust/target/
+agent-rust/.device_id
+
+# Go build artifacts
+server-go/server.exe
+server-go/server

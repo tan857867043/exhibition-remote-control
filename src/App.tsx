@@ -173,9 +173,9 @@ export default function App() {
 
   useEffect(() => {
     if (viewMode !== 'remote' || !clientRef.current) return;
-    let v = 50;
-    if (qualityMode === 'smooth') v = 30;
-    else if (qualityMode === 'hd') v = 75;
+    let v = 80;
+    if (qualityMode === 'smooth') v = 50;
+    else if (qualityMode === 'hd') v = 95;
     clientRef.current.setQuality(v);
   }, [qualityMode, viewMode]);
 
@@ -479,7 +479,7 @@ export default function App() {
             <canvas 
               ref={canvasRef} 
               className="w-full h-full object-contain cursor-crosshair z-10"
-              style={{ filter: qualityMode === 'smooth' ? 'contrast(1.05)' : 'none' }} // Fake visual feedback for modes
+              style={{ imageRendering: qualityMode === 'hd' ? 'crisp-edges' : 'auto', filter: qualityMode === 'smooth' ? 'contrast(1.05)' : 'none' }}
             />
             
             <div className="absolute bottom-6 right-6 flex gap-2 pointer-events-none z-30 opacity-70">

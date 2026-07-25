@@ -41,12 +41,14 @@ class ExhibitionRemoteClient {
     constructor(canvas, serverUrl, deviceId, onStats) {
         this.canvas = canvas;
         this.ctx = canvas.getContext('2d', { alpha: false });
+        this.ctx.imageSmoothingEnabled = false;
         this.serverUrl = serverUrl;
         this.deviceId = deviceId;
         this.onStats = onStats;
 
         this.offscreenCanvas = document.createElement('canvas');
         this.offscreenCtx = this.offscreenCanvas.getContext('2d', { alpha: false });
+        this.offscreenCtx.imageSmoothingEnabled = false;
 
         this.maxFullW = this.canvas.width;
         this.maxFullH = this.canvas.height;
@@ -63,10 +65,11 @@ class ExhibitionRemoteClient {
         this.cursorType = 0;
         this.pendingRender = null;
         this.rAFId = null;
-        this.frameSeq = 0;        // 帧序号，防止 async 竞态
-        this.receivedFrames = 0;  // 收到的帧计数
-        this.renderedFrames = 0;  // 实际渲染的帧计数（用于真实 FPS）
-        this._processingVideo = false; // 视频帧处理中锁，防止并发解码浪费
+        this.frameSeq = 0;
+        this.receivedFrames = 0;
+        this.renderedFrames = 0;
+        this._processingVideo = false;
+        this._useImageDecoder = typeof ImageDecoder !== 'undefined';
 
         this.canvas.style.cursor = 'none';
 
@@ -102,11 +105,12 @@ class ExhibitionRemoteClient {
             if (typeof e.data === 'string') return;
             const buf = new Uint8Array(e.data);
             this.onStats({ type: 'frame', byteLength: buf.length });
-            this.receivedFrames++;
             const totalSize = buf.length;
             if (totalSize < 1) return;
 
             const frameType = buf[0];
+            const isVideoFrame = frameType >= 0x01 && frameType <= 0x04;
+            if (isVideoFrame) this.receivedFrames++;
 
             if (frameType === 0x07) {
                 // === 光标位置 ===
@@ -164,7 +168,7 @@ class ExhibitionRemoteClient {
                 for (let i = 0; i < jpegBatch.length; i += BATCH_SIZE) {
                     const batch = jpegBatch.slice(i, i + BATCH_SIZE);
                     const results = await Promise.all(batch.map(async (b) => {
-                        const bitmap = await createImageBitmap(new Blob([b.data]));
+                        const bitmap = await this._decodeJpeg(b.data);
                         return { bitmap, x: b.x, y: b.y, w: b.w, h: b.h };
                     }));
                     if (batchMySeq !== this.frameSeq) {
@@ -206,14 +210,16 @@ class ExhibitionRemoteClient {
                     this.offscreenCanvas.height = h;
                     this.canvas.width = w;
                     this.canvas.height = h;
+                    this.offscreenCtx.imageSmoothingEnabled = false;
+                    this.ctx.imageSmoothingEnabled = false;
                     this.maxFullW = w;
                     this.maxFullH = h;
                 }
 
                 try {
                     const mySeq = ++this.frameSeq;
-                    const bitmap = await createImageBitmap(new Blob([jpegData]));
-                    if (mySeq !== this.frameSeq) { bitmap.close(); return; } // 过期帧，丢弃
+                    const bitmap = await this._decodeJpeg(jpegData);
+                    if (mySeq !== this.frameSeq) { bitmap.close(); return; }
                     this.offscreenCtx.drawImage(bitmap, 0, 0, w, h);
                     bitmap.close();
                     this.renderedFrames++;
@@ -345,6 +351,19 @@ class ExhibitionRemoteClient {
         this.receivedFrames = 0;
     }
 
+    async _decodeJpeg(jpegData) {
+        if (this._useImageDecoder) {
+            try {
+                const decoder = new ImageDecoder({ data: jpegData, type: 'image/jpeg' });
+                const result = await decoder.decode();
+                return result.image;
+            } catch (e) {
+                this._useImageDecoder = false;
+            }
+        }
+        return await createImageBitmap(new Blob([jpegData]));
+    }
+
     initInputBinding() {
         document.addEventListener('mousemove', this._onMouseMove);
         document.addEventListener('mousedown', this._onMouseDown);
@@ -380,6 +399,7 @@ class ExhibitionRemoteClient {
     _renderLoop() {
         if (this.pendingRender) {
             this.pendingRender = false;
+            this.ctx.imageSmoothingEnabled = false;
             this.ctx.drawImage(this.offscreenCanvas, 0, 0);
             // 绘制光标叠加层
             if (this.cursorX >= 0) {
