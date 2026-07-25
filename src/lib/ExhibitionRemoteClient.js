@@ -77,6 +77,9 @@ class ExhibitionRemoteClient {
         this.keyBatchTimer = null;
         this.currentCursorType = 0;
         this._useImageDecoder = typeof ImageDecoder !== 'undefined';
+        this._processingVideo = false;
+        this._frameSeq = 0;
+        this._rAFId = null;
 
         // Window-level handlers to preserve drag state outside canvas bounds
         this._onMouseMove = (e) => this.sendMouseEvent(e);
@@ -113,79 +116,82 @@ class ExhibitionRemoteClient {
             const buf = new Uint8Array(e.data);
             this.onStats({ type: 'frame', byteLength: buf.length });
 
-            const MIN_HEADER_SIZE = 14;
-            let offset = 0;
-            const tasks = [];
-            let hasFullFrame = false;
-            let cursorType = this.currentCursorType;
-            const totalSize = buf.length;
+            if (this._processingVideo) return;
+            this._processingVideo = true;
+            try {
+                const MIN_HEADER_SIZE = 14;
+                let offset = 0;
+                const totalSize = buf.length;
+                const mySeq = ++this._frameSeq;
+                let cursorType = this.currentCursorType;
 
-            while(offset + MIN_HEADER_SIZE <= totalSize) {
-                const frameType = buf[offset];
-                const x = (buf[offset+1] << 8) | buf[offset+2];
-                const y = (buf[offset+3] << 8) | buf[offset+4];
-                const w = (buf[offset+5] << 8) | buf[offset+6];
-                const h = (buf[offset+7] << 8) | buf[offset+8];
-                const jpegLen = (buf[offset+9] << 24) | (buf[offset+10] << 16) | (buf[offset+11] << 8) | buf[offset+12];
-                cursorType = buf[offset+13];
-                
-                if (frameType === 0x01) {
-                    this.onStats({ type: 'frame', frameType: 0x01, byteLength: 0 });
-                }
+                while (offset + MIN_HEADER_SIZE <= totalSize) {
+                    const frameType = buf[offset];
+                    const x = (buf[offset + 1] << 8) | buf[offset + 2];
+                    const y = (buf[offset + 3] << 8) | buf[offset + 4];
+                    const w = (buf[offset + 5] << 8) | buf[offset + 6];
+                    const h = (buf[offset + 7] << 8) | buf[offset + 8];
+                    const jpegLen = (buf[offset + 9] << 24) | (buf[offset + 10] << 16) | (buf[offset + 11] << 8) | buf[offset + 12];
+                    cursorType = buf[offset + 13];
 
-                const regionSize = MIN_HEADER_SIZE + jpegLen;
-                if(offset + regionSize > totalSize) break;
-                
-                if(w === 0 || h === 0 || jpegLen === 0){
-                    offset += regionSize;
-                    continue;
-                }
-
-                const jpegData = buf.slice(offset + MIN_HEADER_SIZE, offset + regionSize);
-                
-                if (frameType === 0x02 || frameType === 0x04) {
-                    hasFullFrame = true;
-                    if(w !== this.offscreenCanvas.width || h !== this.offscreenCanvas.height) {
-                        this.offscreenCanvas.width = w;
-                        this.offscreenCanvas.height = h;
-                        this.offscreenCtx.imageSmoothingEnabled = false;
-                        this.canvas.width = w;
-                        this.canvas.height = h;
-                        this.ctx.imageSmoothingEnabled = false;
-                        this.maxFullW = w;
-                        this.maxFullH = h;
+                    if (frameType === 0x01) {
+                        this.onStats({ type: 'frame', frameType: 0x01, byteLength: 0 });
                     }
-                }
-                
-                tasks.push(this._decodeJpeg(jpegData).then(bitmap => ({bitmap, x, y, w, h, frameType})));
-                offset += regionSize;
-            }
 
-            Promise.all(tasks).then(results => {
-                for (const {bitmap, x, y, w, h, frameType} of results) {
-                    if (frameType === 0x02 || frameType === 0x04) {
-                        this.offscreenCtx.drawImage(bitmap, 0, 0);
-                    } else {
-                        this.offscreenCtx.drawImage(bitmap, x, y);
-                        this.ctx.drawImage(bitmap, x, y);
+                    const regionSize = MIN_HEADER_SIZE + jpegLen;
+                    if (offset + regionSize > totalSize) break;
+
+                    if (w === 0 || h === 0 || jpegLen === 0) {
+                        offset += regionSize;
+                        continue;
                     }
+
+                    const jpegData = buf.slice(offset + MIN_HEADER_SIZE, offset + regionSize);
+
+                    if (frameType === 0x02 || frameType === 0x03 || frameType === 0x04) {
+                        if (w !== this.offscreenCanvas.width || h !== this.offscreenCanvas.height) {
+                            this.offscreenCanvas.width = w;
+                            this.offscreenCanvas.height = h;
+                            this.offscreenCtx.imageSmoothingEnabled = false;
+                            this.canvas.width = w;
+                            this.canvas.height = h;
+                            this.ctx.imageSmoothingEnabled = false;
+                            this.maxFullW = w;
+                            this.maxFullH = h;
+                        }
+                    }
+
+                    const bitmap = await this._decodeJpeg(jpegData);
+                    if (mySeq !== this._frameSeq) { bitmap.close(); return; }
+                    this.offscreenCtx.drawImage(bitmap, x, y, w, h);
                     bitmap.close();
-                }
-                if (hasFullFrame) {
-                    this.ctx.drawImage(this.offscreenCanvas, 0, 0);
+                    offset += regionSize;
                 }
 
-                // Dynamically update Canvas native OS cursor style for 100% realistic mouse feel
-                if (this.currentCursorType !== cursorType) {
-                    this.currentCursorType = cursorType;
-                    this.updateCursorStyle();
+                if (mySeq === this._frameSeq) {
+                    this._scheduleRender();
+                    if (this.currentCursorType !== cursorType) {
+                        this.currentCursorType = cursorType;
+                        this.updateCursorStyle();
+                    }
                 }
-            }).catch(() => {});
+            } finally {
+                this._processingVideo = false;
+            }
         };
 
         this.ws.onclose = () => {
             console.log("Disconnected from device stream");
         };
+    }
+
+    _scheduleRender() {
+        if (this._rAFId === null) {
+            this._rAFId = requestAnimationFrame(() => {
+                this._rAFId = null;
+                this.ctx.drawImage(this.offscreenCanvas, 0, 0);
+            });
+        }
     }
 
     async _decodeJpeg(jpegData) {
@@ -367,6 +373,10 @@ class ExhibitionRemoteClient {
     }
 
     destroy() {
+        if (this._rAFId !== null) {
+            cancelAnimationFrame(this._rAFId);
+            this._rAFId = null;
+        }
         if (this.ws) {
             this.ws.close();
             this.ws = null;

@@ -89,12 +89,12 @@ func handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if messageType == websocket.BinaryMessage {
-			if len(payload) > 14 && (payload[0] == 0x02 || payload[0] == 0x04) { // 0x02 or 0x04 indicates full frame
+			if len(payload) > 14 && (payload[0] == 0x02 || payload[0] == 0x03 || payload[0] == 0x04) {
 				GlobalHub.mu.Lock()
-				// Extract JPEG bytes (skip 14 bytes header)
-				jpegBytes := make([]byte, len(payload)-14)
-				copy(jpegBytes, payload[14:])
-				GlobalHub.LatestFrame[deviceID] = jpegBytes
+				// 保存完整帧（含 14 字节头），供新订阅者连接时直接推送
+				frame := make([]byte, len(payload))
+				copy(frame, payload)
+				GlobalHub.LatestFrame[deviceID] = frame
 				GlobalHub.mu.Unlock()
 			}
 			GlobalHub.mu.RLock()
@@ -175,7 +175,7 @@ func handleThumbnail(w http.ResponseWriter, r *http.Request) {
 	frame, exists := GlobalHub.LatestFrame[deviceID]
 	GlobalHub.mu.RUnlock()
 
-	if !exists || len(frame) == 0 {
+	if !exists || len(frame) < 15 {
 		w.WriteHeader(http.StatusNotFound)
 		w.Write([]byte("Thumbnail not available yet"))
 		return
@@ -184,7 +184,8 @@ func handleThumbnail(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "image/jpeg")
 	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Write(frame)
+	// 跳过 14 字节头，输出纯 JPEG 数据
+	w.Write(frame[14:])
 }
 
 func handleStreamSubscribe(w http.ResponseWriter, r *http.Request) {
@@ -201,6 +202,14 @@ func handleStreamSubscribe(w http.ResponseWriter, r *http.Request) {
 	}
 	GlobalHub.Subscribers[deviceID][conn] = true
 	GlobalHub.mu.Unlock()
+
+	// 订阅时立即推送最新缓存帧，确保被控端画面静止时控制窗口也能显示画面
+	GlobalHub.mu.RLock()
+	latestFrame := GlobalHub.LatestFrame[deviceID]
+	GlobalHub.mu.RUnlock()
+	if latestFrame != nil {
+		conn.WriteMessage(websocket.BinaryMessage, latestFrame)
+	}
 
 	defer func() {
 		GlobalHub.mu.Lock()

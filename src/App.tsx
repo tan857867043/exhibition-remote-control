@@ -492,8 +492,8 @@ export default function App() {
         <div ref={containerRef} className="flex flex-col h-full bg-black relative">
           
           {/* Top Floating Toolbar (auto-hide can be added later) */}
-          <div className="absolute top-0 left-0 right-0 h-14 bg-slate-900/90 backdrop-blur-md border-b border-slate-700/50 z-40 flex items-center justify-between px-4 opacity-0 hover:opacity-100 transition-opacity duration-300" style={{ opacity: isFullscreen ? undefined : 1 }}>
-            <div className="flex items-center gap-4">
+          <div className="absolute top-0 left-0 right-0 h-14 bg-slate-900/90 backdrop-blur-md border-b border-slate-700/50 z-40 flex items-center justify-between px-4 opacity-0 hover:opacity-100 transition-opacity duration-300 pointer-events-none" style={{ opacity: isFullscreen ? undefined : 1 }}>
+            <div className="flex items-center gap-4 pointer-events-auto">
               <button 
                 onClick={disconnectDevice}
                 className="p-2 hover:bg-slate-800 rounded-lg text-slate-300 hover:text-white transition-colors flex items-center gap-2"
@@ -512,7 +512,7 @@ export default function App() {
               </div>
             </div>
 
-            <div className="flex items-center bg-slate-950/50 rounded-lg border border-slate-800 p-1 gap-1">
+            <div className="flex items-center bg-slate-950/50 rounded-lg border border-slate-800 p-1 gap-1 pointer-events-auto">
               <button 
                 onClick={() => setQualityMode('smooth')}
                 className={`px-3 py-1.5 rounded text-xs font-bold transition-colors flex items-center gap-1.5 ${qualityMode === 'smooth' ? 'bg-slate-700 text-white' : 'text-slate-400 hover:text-slate-200'}`}
@@ -533,7 +533,7 @@ export default function App() {
               </button>
             </div>
 
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-3 pointer-events-auto">
               <button 
                 onClick={() => setFileModalOpen(true)}
                 className="px-3 py-1.5 bg-blue-600/90 hover:bg-blue-500 text-white rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 shadow-md shadow-blue-500/20 active:scale-95"
@@ -574,12 +574,15 @@ export default function App() {
             onDragOver={handleCanvasDragOver}
             onDragLeave={handleCanvasDragLeave}
             onDrop={handleCanvasDrop}
-            className="flex-1 relative flex items-center justify-center overflow-hidden"
+            className="flex-1 relative flex items-center justify-center overflow-hidden pt-14"
           >
             <canvas 
               ref={canvasRef} 
-              className="w-full h-full object-contain z-10"
-              style={{ filter: qualityMode === 'smooth' ? 'contrast(1.05)' : 'none' }} // Fake visual feedback for modes
+              className="w-full h-full"
+              style={{ 
+                filter: qualityMode === 'smooth' ? 'contrast(1.05)' : 'none',
+                objectFit: 'contain',
+              }}
             />
 
             {/* Canvas Drag and Drop Overlay */}
