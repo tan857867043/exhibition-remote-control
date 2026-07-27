@@ -1,5 +1,5 @@
 import React, { useState, useRef } from "react";
-import { FolderUp, UploadCloud, FileText, CheckCircle2, AlertCircle, X, Folder, HardDrive, Check, Clock, ArrowRight } from "lucide-react";
+import { FolderUp, UploadCloud, FileText, CheckCircle2, AlertCircle, X, Folder, HardDrive, Check, Clock, RefreshCw } from "lucide-react";
 
 export interface TransferTask {
   id: string;
@@ -8,7 +8,7 @@ export interface TransferTask {
   targetDir: string;
   progress: number;
   speedMBs: number;
-  status: "pending" | "transferring" | "completed" | "failed";
+  status: "pending" | "transferring" | "completed" | "failed" | "skipped";
   error?: string;
   timestamp: string;
 }
@@ -19,9 +19,10 @@ interface FileTransferModalProps {
   deviceName: string;
   targetDir: string;
   setTargetDir: (dir: string) => void;
-  onSendFiles: (files: FileList | File[], dir: string) => void;
+  onSendFiles: (files: FileList | File[], dir: string, overwriteMode: string, applyToAll: boolean, directories?: string[]) => void;
   tasks: TransferTask[];
   onClearHistory: () => void;
+  onRetryFile: (task: TransferTask) => void;
 }
 
 const PRESET_PATHS = [
@@ -30,6 +31,72 @@ const PRESET_PATHS = [
   { label: "C 盘根目录", path: "C:\\", icon: HardDrive },
   { label: "D 盘根目录", path: "D:\\", icon: HardDrive },
 ];
+
+// 递归遍历拖拽的文件夹，提取所有文件（保留相对路径）
+async function traverseFileTree(items: DataTransferItemList, relativePath: string, result: File[]): Promise<void> {
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    const entry = item.webkitGetAsEntry?.();
+    if (!entry) {
+      const file = item.getAsFile();
+      if (file) {
+        // 将相对路径注入到 file 对象上
+        (file as any)._relativePath = relativePath;
+        result.push(file);
+      }
+      continue;
+    }
+    if (entry.isFile) {
+      const file = await new Promise<File>((resolve) => {
+        (entry as FileSystemFileEntry).file((f) => {
+          (f as any)._relativePath = relativePath;
+          resolve(f);
+        });
+      });
+      result.push(file);
+    } else if (entry.isDirectory) {
+      const dirReader = (entry as FileSystemDirectoryEntry).createReader();
+      const entries = await new Promise<FileSystemEntry[]>((resolve) => {
+        dirReader.readEntries(resolve);
+      });
+      const subPath = relativePath ? `${relativePath}\\${entry.name}` : entry.name;
+      for (const subEntry of entries) {
+        await traverseEntry(subEntry, subPath, result);
+      }
+    }
+  }
+}
+
+async function traverseEntry(entry: FileSystemEntry, relativePath: string, result: File[]): Promise<void> {
+  if (entry.isFile) {
+    const file = await new Promise<File>((resolve) => {
+      (entry as FileSystemFileEntry).file((f) => {
+        (f as any)._relativePath = relativePath;
+        resolve(f);
+      });
+    });
+    result.push(file);
+  } else if (entry.isDirectory) {
+    const dirReader = (entry as FileSystemDirectoryEntry).createReader();
+    // readEntries 可能分多批返回（每批最多 100 条），需要循环读取
+    const getEntries = (): Promise<FileSystemEntry[]> => new Promise((resolve) => {
+      const all: FileSystemEntry[] = [];
+      const readBatch = () => {
+        dirReader.readEntries((batch) => {
+          if (batch.length === 0) { resolve(all); return; }
+          all.push(...batch);
+          readBatch();
+        });
+      };
+      readBatch();
+    });
+    const entries = await getEntries();
+    const subPath = relativePath ? `${relativePath}\\${entry.name}` : entry.name;
+    for (const subEntry of entries) {
+      await traverseEntry(subEntry, subPath, result);
+    }
+  }
+}
 
 export const FileTransferModal: React.FC<FileTransferModalProps> = ({
   isOpen,
@@ -40,15 +107,18 @@ export const FileTransferModal: React.FC<FileTransferModalProps> = ({
   onSendFiles,
   tasks,
   onClearHistory,
+  onRetryFile,
 }) => {
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [overwriteMode, setOverwriteMode] = useState("skip");
+  const [applyToAll, setApplyToAll] = useState(false);
 
   if (!isOpen) return null;
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
-      onSendFiles(e.target.files, targetDir);
+      onSendFiles(e.target.files, targetDir, overwriteMode, applyToAll);
       if (fileInputRef.current) fileInputRef.current.value = "";
     }
   };
@@ -65,12 +135,24 @@ export const FileTransferModal: React.FC<FileTransferModalProps> = ({
     setIsDragging(false);
   };
 
-  const handleDrop = (e: React.DragEvent) => {
+  const handleDrop = async (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
     setIsDragging(false);
-    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      onSendFiles(e.dataTransfer.files, targetDir);
+    if (e.dataTransfer.items && e.dataTransfer.items.length > 0) {
+      const allFiles: File[] = [];
+      await traverseFileTree(e.dataTransfer.items, "", allFiles);
+      if (allFiles.length > 0) {
+        // Collect unique directory paths from relative paths
+        const dirSet = new Set<string>();
+        for (const file of allFiles) {
+          const relPath = (file as any)._relativePath;
+          if (relPath) {
+            dirSet.add(relPath);
+          }
+        }
+        onSendFiles(allFiles, targetDir, overwriteMode, applyToAll, Array.from(dirSet));
+      }
     }
   };
 
@@ -153,6 +235,31 @@ export const FileTransferModal: React.FC<FileTransferModalProps> = ({
             </div>
           </div>
 
+          {/* Conflict Strategy */}
+          <div className="flex items-center gap-4 flex-wrap">
+            <div className="flex items-center gap-2">
+              <label className="text-xs font-medium text-slate-400">冲突策略:</label>
+              <select
+                value={overwriteMode}
+                onChange={(e) => setOverwriteMode(e.target.value)}
+                className="bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-blue-500 transition-colors"
+              >
+                <option value="skip">跳过</option>
+                <option value="overwrite">覆盖</option>
+                <option value="rename">重命名</option>
+              </select>
+            </div>
+            <label className="flex items-center gap-2 text-xs text-slate-400 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={applyToAll}
+                onChange={(e) => setApplyToAll(e.target.checked)}
+                className="rounded border-slate-700 bg-slate-950 text-blue-500 focus:ring-blue-500/50"
+              />
+              全部应用
+            </label>
+          </div>
+
           {/* Drag & Drop Dropzone */}
           <div
             onDragOver={handleDragOver}
@@ -202,69 +309,143 @@ export const FileTransferModal: React.FC<FileTransferModalProps> = ({
               )}
             </div>
 
+            {/* Overall Progress */}
+            {tasks.length > 0 && (() => {
+              const totalTasks = tasks.length;
+              const doneCount = tasks.filter(t => t.status === "completed" || t.status === "failed" || t.status === "skipped").length;
+              const transferringTask = tasks.find(t => t.status === "transferring");
+              const remainingBytes = tasks.reduce((sum, t) => {
+                if (t.status === "transferring") return sum + t.fileSize * (1 - t.progress / 100);
+                if (t.status === "pending") return sum + t.fileSize;
+                return sum;
+              }, 0);
+              const speedBps = transferringTask ? transferringTask.speedMBs * 1024 * 1024 : 0;
+              const etaSeconds = speedBps > 0 ? remainingBytes / speedBps : 0;
+              const formatETA = (sec: number): string => {
+                if (sec < 1) return "< 1秒";
+                if (sec < 60) return `${Math.round(sec)}秒`;
+                const min = Math.floor(sec / 60);
+                const s = Math.round(sec % 60);
+                return s > 0 ? `${min}分${s}秒` : `${min}分`;
+              };
+              return (
+                <div className="flex items-center gap-4 mb-3 text-xs">
+                  <span className="text-slate-400">
+                    <span className="text-blue-400 font-semibold">{doneCount}</span>
+                    <span className="text-slate-500">/{totalTasks} 个文件</span>
+                  </span>
+                  {etaSeconds > 0 && (
+                    <span className="text-slate-500">
+                      预计剩余 <span className="text-amber-400 font-mono">{formatETA(etaSeconds)}</span>
+                    </span>
+                  )}
+                </div>
+              );
+            })()}
+
             {tasks.length === 0 ? (
               <div className="py-8 text-center border border-slate-800/60 rounded-xl bg-slate-950/30 text-slate-500 text-xs">
                 暂无传输任务，选择文件即可开始投送
               </div>
             ) : (
               <div className="space-y-2.5 max-h-52 overflow-y-auto pr-1 custom-scrollbar">
-                {tasks.map((task) => (
-                  <div
-                    key={task.id}
-                    className="p-3 bg-slate-950/60 border border-slate-800/80 rounded-xl flex flex-col gap-2"
-                  >
-                    <div className="flex items-center justify-between gap-3">
-                      <div className="flex items-center gap-2.5 min-w-0">
-                        <FileText className="w-4 h-4 text-blue-400 shrink-0" />
-                        <div className="min-w-0">
-                          <p className="text-xs font-medium text-slate-200 truncate">{task.fileName}</p>
-                          <p className="text-[10px] text-slate-400 truncate">
-                            {formatSize(task.fileSize)} • 保存至 {task.targetDir}
-                          </p>
+                {tasks.map((task) => {
+                  const statusColors: Record<string, string> = {
+                    transferring: "border-blue-500/30",
+                    completed: "border-emerald-500/30",
+                    failed: "border-rose-500/30",
+                    skipped: "border-amber-500/30",
+                    pending: "border-slate-700",
+                  };
+                  const statusBadgeColors: Record<string, string> = {
+                    transferring: "text-blue-400 bg-blue-500/10 border-blue-500/20",
+                    completed: "text-emerald-400 bg-emerald-500/10 border-emerald-500/20",
+                    failed: "text-rose-400 bg-rose-500/10 border-rose-500/20",
+                    skipped: "text-amber-400 bg-amber-500/10 border-amber-500/20",
+                    pending: "text-slate-400 bg-slate-800 border-slate-700",
+                  };
+                  const statusLabels: Record<string, string> = {
+                    transferring: "传输中",
+                    completed: "完成",
+                    failed: "失败",
+                    skipped: "已跳过",
+                    pending: "等待中",
+                  };
+                  const progressBarColor: Record<string, string> = {
+                    transferring: "bg-blue-500",
+                    completed: "bg-emerald-500",
+                    failed: "bg-rose-500",
+                    skipped: "bg-amber-500",
+                    pending: "bg-slate-600",
+                  };
+                  return (
+                    <div
+                      key={task.id}
+                      className={`p-3 bg-slate-950/60 border rounded-xl flex flex-col gap-2 ${statusColors[task.status] || "border-slate-800/80"}`}
+                    >
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="flex items-center gap-2.5 min-w-0">
+                          <FileText className={`w-4 h-4 shrink-0 ${
+                            task.status === "transferring" ? "text-blue-400" :
+                            task.status === "completed" ? "text-emerald-400" :
+                            task.status === "failed" ? "text-rose-400" :
+                            task.status === "skipped" ? "text-amber-400" :
+                            "text-slate-500"
+                          }`} />
+                          <div className="min-w-0">
+                            <p className="text-xs font-medium text-slate-200 truncate">{task.fileName}</p>
+                            <p className="text-[10px] text-slate-400 truncate">
+                              {formatSize(task.fileSize)} • 保存至 {task.targetDir}
+                            </p>
+                            {/* Error message for failed tasks */}
+                            {task.status === "failed" && task.error && (
+                              <p className="text-[10px] text-rose-400 mt-0.5">{task.error}</p>
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-2 shrink-0">
+                          {task.status === "transferring" && (
+                            <span className="text-[11px] font-mono font-semibold text-blue-400">
+                              {task.speedMBs.toFixed(1)} MB/s
+                            </span>
+                          )}
+                          <span className={`flex items-center gap-1 text-[10px] font-medium px-2 py-0.5 rounded-full border ${statusBadgeColors[task.status] || ""}`}>
+                            {task.status === "completed" && <CheckCircle2 className="w-3 h-3" />}
+                            {task.status === "failed" && <AlertCircle className="w-3 h-3" />}
+                            {statusLabels[task.status] || task.status}
+                          </span>
+                          {/* Retry button for failed and skipped tasks */}
+                          {(task.status === "failed" || task.status === "skipped") && (
+                            <button
+                              onClick={() => onRetryFile(task)}
+                              className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-700 transition-colors"
+                              title="重试"
+                            >
+                              <RefreshCw className="w-3.5 h-3.5" />
+                            </button>
+                          )}
                         </div>
                       </div>
 
-                      <div className="flex items-center gap-2 shrink-0">
-                        {task.status === "transferring" && (
-                          <span className="text-[11px] font-mono font-semibold text-blue-400">
-                            {task.speedMBs.toFixed(1)} MB/s
-                          </span>
-                        )}
-                        {task.status === "completed" && (
-                          <span className="flex items-center gap-1 text-[10px] text-emerald-400 font-medium bg-emerald-500/10 border border-emerald-500/20 px-2 py-0.5 rounded-full">
-                            <CheckCircle2 className="w-3 h-3" /> 已完成
-                          </span>
-                        )}
-                        {task.status === "failed" && (
-                          <span className="flex items-center gap-1 text-[10px] text-rose-400 font-medium bg-rose-500/10 border border-rose-500/20 px-2 py-0.5 rounded-full">
-                            <AlertCircle className="w-3 h-3" /> 失败
-                          </span>
-                        )}
-                        {task.status === "pending" && (
-                          <span className="text-[10px] text-slate-400 bg-slate-800 px-2 py-0.5 rounded-full">
-                            等待中
-                          </span>
-                        )}
-                      </div>
+                      {/* Progress Bar for transferring */}
+                      {task.status === "transferring" && (
+                        <div className="space-y-1">
+                          <div className="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                            <div
+                              className={`${progressBarColor[task.status]} h-full transition-all duration-150 rounded-full`}
+                              style={{ width: `${task.progress}%` }}
+                            />
+                          </div>
+                          <div className="flex justify-between text-[10px] text-slate-400 font-mono">
+                            <span>传输中...</span>
+                            <span>{task.progress}%</span>
+                          </div>
+                        </div>
+                      )}
                     </div>
-
-                    {/* Progress Bar for transferring or pending */}
-                    {task.status === "transferring" && (
-                      <div className="space-y-1">
-                        <div className="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
-                          <div
-                            className="bg-blue-500 h-full transition-all duration-150 rounded-full"
-                            style={{ width: `${task.progress}%` }}
-                          />
-                        </div>
-                        <div className="flex justify-between text-[10px] text-slate-400 font-mono">
-                          <span>传输中...</span>
-                          <span>{task.progress}%</span>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>

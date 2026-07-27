@@ -107,6 +107,19 @@ func handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			GlobalHub.mu.RUnlock()
+		} else if messageType == websocket.TextMessage {
+			displayLen := len(payload)
+			if displayLen > 200 {
+				displayLen = 200
+			}
+			log.Printf("[Hub] Agent %s sent text: %s", deviceID, string(payload[:displayLen]))
+			GlobalHub.mu.RLock()
+			subs := GlobalHub.Subscribers[deviceID]
+			log.Printf("[Hub] Forwarding text to %d subscribers", len(subs))
+			for subConn := range subs {
+				subConn.WriteMessage(websocket.TextMessage, payload)
+			}
+			GlobalHub.mu.RUnlock()
 		}
 	}
 }
@@ -197,11 +210,22 @@ func handleStreamSubscribe(w http.ResponseWriter, r *http.Request) {
 	deviceID := r.URL.Query().Get("device_id")
 
 	GlobalHub.mu.Lock()
+	wasEmpty := len(GlobalHub.Subscribers[deviceID]) == 0
 	if GlobalHub.Subscribers[deviceID] == nil {
 		GlobalHub.Subscribers[deviceID] = make(map[*websocket.Conn]bool)
 	}
 	GlobalHub.Subscribers[deviceID][conn] = true
 	GlobalHub.mu.Unlock()
+
+	// 第一个订阅者连接时通知 Agent 恢复截图
+	if wasEmpty {
+		GlobalHub.mu.RLock()
+		agentConn, exists := GlobalHub.Agents[deviceID]
+		GlobalHub.mu.RUnlock()
+		if exists {
+			agentConn.WriteMessage(websocket.TextMessage, []byte(`{"action":"resume"}`))
+		}
+	}
 
 	// 订阅时立即推送最新缓存帧，确保被控端画面静止时控制窗口也能显示画面
 	GlobalHub.mu.RLock()
@@ -212,15 +236,27 @@ func handleStreamSubscribe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	defer func() {
+		var becameEmpty bool
 		GlobalHub.mu.Lock()
 		if GlobalHub.Subscribers[deviceID] != nil {
 			delete(GlobalHub.Subscribers[deviceID], conn)
 			if len(GlobalHub.Subscribers[deviceID]) == 0 {
 				delete(GlobalHub.Subscribers, deviceID)
+				becameEmpty = true
 			}
 		}
 		GlobalHub.mu.Unlock()
 		conn.Close()
+
+		// 最后一个订阅者离开时通知 Agent 暂停截图
+		if becameEmpty {
+			GlobalHub.mu.RLock()
+			agentConn, exists := GlobalHub.Agents[deviceID]
+			GlobalHub.mu.RUnlock()
+			if exists {
+				agentConn.WriteMessage(websocket.TextMessage, []byte(`{"action":"pause"}`))
+			}
+		}
 	}()
 
 	// 挂起连接持续等待监听退订事件和控制指令
@@ -232,11 +268,20 @@ func handleStreamSubscribe(w http.ResponseWriter, r *http.Request) {
 
 		// 将客户端发来的 WebSocket 文本消息（控制指令）透传给 Agent，降低控制延迟
 		if messageType == websocket.TextMessage || messageType == websocket.BinaryMessage {
+			if messageType == websocket.TextMessage {
+				displayLen := len(payload)
+				if displayLen > 200 {
+					displayLen = 200
+				}
+				log.Printf("[Hub] Subscriber for %s sent text: %s", deviceID, string(payload[:displayLen]))
+			}
 			GlobalHub.mu.RLock()
 			agentConn, exists := GlobalHub.Agents[deviceID]
 			GlobalHub.mu.RUnlock()
 			if exists {
 				agentConn.WriteMessage(messageType, payload)
+			} else {
+				log.Printf("[Hub] Agent %s not found, cannot forward message", deviceID)
 			}
 		}
 	}

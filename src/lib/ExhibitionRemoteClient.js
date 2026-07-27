@@ -80,6 +80,13 @@ class ExhibitionRemoteClient {
         this._processingVideo = false;
         this._frameSeq = 0;
         this._rAFId = null;
+        this._wheelAccum = 0;
+
+        // File transfer state
+        this._fmCallback = null;
+
+        this._downloadState = null;
+        this._uploadState = null;
 
         // Window-level handlers to preserve drag state outside canvas bounds
         this._onMouseMove = (e) => this.sendMouseEvent(e);
@@ -112,8 +119,65 @@ class ExhibitionRemoteClient {
         };
 
         this.ws.onmessage = async (e) => {
-            if (typeof e.data === 'string') return;
+            if (typeof e.data === 'string') {
+                try {
+                    const msg = JSON.parse(e.data);
+                    console.log("[WS] Received text message:", msg.action, msg);
+                    if (msg.action && (msg.action === 'download' || msg.action === 'upload')) {
+                        this._handleFileMessage(msg);
+                    } else if (this._fmCallback) {
+                        console.log("[WS] Routing to _fmCallback:", msg.action);
+                        this._fmCallback(msg);
+                    }
+                } catch(err) {
+                    console.error("[WS] Failed to parse text message:", err, e.data);
+                }
+                return;
+            }
             const buf = new Uint8Array(e.data);
+
+            if (buf.length >= 4 && buf[0] === 0x01 && buf[1] === 0x00 && buf[2] === 0x00 && this._downloadState) {
+                const state = this._downloadState;
+
+                if (state.cancelled) {
+                    return;
+                }
+
+                const isLast = buf[3] === 0x01;
+                const chunkData = buf.slice(4);
+                
+                state.chunks.push(chunkData);
+                state.receivedSize += chunkData.length;
+                
+                if (state.onProgress && state.totalSize > 0) {
+                    const progress = Math.min(100, Math.round((state.receivedSize / state.totalSize) * 100));
+                    const elapsed = state.startTime > 0 ? (performance.now() - state.startTime) / 1000 : 0;
+                    const speedMBs = elapsed > 0 ? (state.receivedSize / 1024 / 1024) / elapsed : 0;
+                    state.onProgress(progress, speedMBs, 'transferring');
+                }
+                
+                if (!isLast && !state.paused) {
+                    this.ws.send(JSON.stringify({
+                        action: 'download',
+                        sub: 'ack',
+                        id: state.id,
+                    }));
+                }
+                
+                if (isLast) {
+                    const combined = new Uint8Array(state.receivedSize);
+                    let offset = 0;
+                    for (let i = 0; i < state.chunks.length; i++) {
+                        combined.set(state.chunks[i], offset);
+                        offset += state.chunks[i].length;
+                    }
+                    if (state.doneResolve) {
+                        state.doneResolve(combined.buffer);
+                    }
+                }
+                return;
+            }
+
             this.onStats({ type: 'frame', byteLength: buf.length });
 
             if (this._processingVideo) return;
@@ -182,6 +246,14 @@ class ExhibitionRemoteClient {
 
         this.ws.onclose = () => {
             console.log("Disconnected from device stream");
+            if (this._downloadState && this._downloadState.errorReject) {
+                this._downloadState.errorReject(new Error('disconnected'));
+            }
+            if (this._uploadState && this._uploadState.errorReject) {
+                this._uploadState.errorReject(new Error('disconnected'));
+            }
+            this._downloadState = null;
+            this._uploadState = null;
         };
     }
 
@@ -262,7 +334,9 @@ class ExhibitionRemoteClient {
         const { x, y, isWithin } = this.getCanvasCoordinates(e);
         if (!isWithin && e.type !== 'mouseup' && e.type !== 'mousemove') return;
 
-        const btn = e.button; 
+        // Web button → Agent mapping: Web(0=Left,1=Middle,2=Right) → Agent(0=Left,1=Right,2=Middle)
+        const BTN_MAP = [0, 2, 1];
+        const btn = BTN_MAP[e.button] ?? e.button;
         let buf;
 
         if (e.type === 'mousemove') {
@@ -277,8 +351,17 @@ class ExhibitionRemoteClient {
             buf = new Uint8Array([0x02, btn, 0, 0, 0, 0]);
         } else if (e.type === 'wheel') {
             e.preventDefault();
-            const d = Math.round(e.deltaY);
-            buf = new Uint8Array([0x03, 0, d & 0xFF, (d >> 8) & 0xFF, 0, 0]);
+            // Accumulate deltas and send notch count when reaching WHEEL_DELTA threshold
+            // Works with all mice: Chrome(~100/notch), Firefox(~3), smooth-scroll(~4-16)
+            this._wheelAccum += e.deltaY;
+            const clicks = Math.trunc(this._wheelAccum / 120);
+            if (clicks !== 0) {
+                this._wheelAccum -= clicks * 120;
+                const d = clicks;
+                buf = new Uint8Array([0x03, 0, d & 0xFF, (d >> 8) & 0xFF, 0, 0]);
+            } else {
+                return;
+            }
         } else {
             return;
         }
@@ -337,6 +420,270 @@ class ExhibitionRemoteClient {
     setQuality(qualityValue) {
         if (this.ws && this.ws.readyState === WebSocket.OPEN) {
             this.ws.send(JSON.stringify({ action: 'quality', value: qualityValue }));
+        }
+    }
+
+    _handleFileMessage(msg) {
+        switch(msg.action) {
+            case 'file_error':
+                if (this._downloadState && this._downloadState.errorReject) {
+                    this._downloadState.errorReject(new Error(msg.error || 'download_error'));
+                }
+                if (this._uploadState && this._uploadState.errorReject) {
+                    this._uploadState.errorReject(new Error(msg.error || 'upload_error'));
+                }
+                break;
+            case 'download':
+                if (msg.sub === 'start') {
+                    if (this._downloadState) {
+                        this._downloadState.totalSize = msg.size || 0;
+                        if (this._downloadState.readyResolve) {
+                            this._downloadState.readyResolve();
+                        }
+                    }
+                }
+                break;
+            case 'upload':
+                if (msg.sub === 'start' && this._uploadState) {
+                    if (this._uploadState.readyResolve) {
+                        this._uploadState.readyResolve();
+                    }
+                } else if (msg.sub === 'done' && this._uploadState) {
+                    if (this._uploadState.doneResolve) {
+                        this._uploadState.doneResolve();
+                    }
+                } else if (msg.sub === 'error' && this._uploadState) {
+                    if (this._uploadState.errorReject) {
+                        this._uploadState.errorReject(new Error(msg.error || 'upload_error'));
+                    }
+                }
+                break;
+        }
+    }
+
+    setFileManagerCallback(cb) {
+        this._fmCallback = cb;
+    }
+
+    pauseTransfer() {
+        if (this._uploadState) {
+            this._uploadState.paused = true;
+        }
+        if (this._downloadState) {
+            this._downloadState.paused = true;
+        }
+    }
+
+    resumeTransfer() {
+        if (this._uploadState) {
+            this._uploadState.paused = false;
+            if (this._uploadState.pauseResolve) {
+                const resolve = this._uploadState.pauseResolve;
+                this._uploadState.pauseResolve = null;
+                resolve();
+            }
+        }
+        if (this._downloadState) {
+            this._downloadState.paused = false;
+            if (this._downloadState.pauseResolve) {
+                const resolve = this._downloadState.pauseResolve;
+                this._downloadState.pauseResolve = null;
+                resolve();
+            }
+        }
+    }
+
+    cancelTransfer() {
+        if (this._uploadState) {
+            this._uploadState.cancelled = true;
+            this._uploadState.paused = false;
+            if (this._uploadState.pauseResolve) {
+                const resolve = this._uploadState.pauseResolve;
+                this._uploadState.pauseResolve = null;
+                resolve();
+            }
+            if (this._uploadState.errorReject) {
+                this._uploadState.errorReject(new Error('cancelled'));
+            }
+        }
+        if (this._downloadState) {
+            this._downloadState.cancelled = true;
+            this._downloadState.paused = false;
+            if (this._downloadState.pauseResolve) {
+                const resolve = this._downloadState.pauseResolve;
+                this._downloadState.pauseResolve = null;
+                resolve();
+            }
+            if (this._downloadState.errorReject) {
+                this._downloadState.errorReject(new Error('cancelled'));
+            }
+        }
+    }
+
+    async sendFile(file, targetDir, options, onProgress) {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+            throw new Error('WebSocket not connected');
+        }
+
+        const CHUNK_SIZE = 16 * 1024;
+        const uploadId = 'ul_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+
+        const state = {
+            id: uploadId,
+            file: file,
+            totalSize: file.size,
+            sentSize: 0,
+            readyResolve: null,
+            doneResolve: null,
+            errorReject: null,
+            onProgress: onProgress,
+            paused: false,
+            cancelled: false,
+            pauseResolve: null,
+        };
+        this._uploadState = state;
+
+        try {
+            await new Promise((resolve, reject) => {
+                state.readyResolve = resolve;
+                state.errorReject = reject;
+                const timeout = setTimeout(() => reject(new Error('upload start timeout')), 30000);
+                state.errorReject = (err) => {
+                    clearTimeout(timeout);
+                    reject(err);
+                };
+                this.ws.send(JSON.stringify({
+                    action: 'upload',
+                    sub: 'start',
+                    path: targetDir,
+                    name: file.name,
+                    size: file.size,
+                    id: uploadId,
+                }));
+            });
+
+            const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+            const startTime = performance.now();
+
+            for (let i = 0; i < totalChunks; i++) {
+                if (state.cancelled) {
+                    throw new Error('cancelled');
+                }
+                while (state.paused) {
+                    await new Promise((resolve) => { state.pauseResolve = resolve; });
+                }
+                if (state.cancelled) {
+                    throw new Error('cancelled');
+                }
+
+                const begin = i * CHUNK_SIZE;
+                const end = Math.min(begin + CHUNK_SIZE, file.size);
+                const chunkData = await file.slice(begin, end).arrayBuffer();
+
+                const header = new Uint8Array([0x09]);
+                const combined = new Uint8Array(1 + chunkData.byteLength);
+                combined.set(header);
+                combined.set(new Uint8Array(chunkData), 1);
+                this.ws.send(combined.buffer);
+
+                state.sentSize += chunkData.byteLength;
+
+                if (onProgress && (i % 8 === 0 || i === totalChunks - 1)) {
+                    const progress = Math.round((state.sentSize / state.totalSize) * 100);
+                    const elapsed = (performance.now() - startTime) / 1000;
+                    const speedMBs = elapsed > 0 ? (state.sentSize / 1024 / 1024) / elapsed : 0;
+                    onProgress(progress, speedMBs, 'transferring');
+                }
+            }
+
+            while (this.ws.bufferedAmount > 0) {
+                await new Promise(r => setTimeout(r, 5));
+            }
+
+            this.ws.send(JSON.stringify({
+                action: 'upload',
+                sub: 'done',
+                id: uploadId,
+            }));
+
+            await new Promise((resolve, reject) => {
+                state.doneResolve = resolve;
+                state.errorReject = reject;
+                setTimeout(() => reject(new Error('upload done timeout')), 60000);
+            });
+
+            if (onProgress) onProgress(100, 0, 'completed');
+        } finally {
+            this._uploadState = null;
+        }
+    }
+
+    async downloadFile(remotePath, onProgress) {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+            throw new Error('WebSocket not connected');
+        }
+
+        const downloadId = 'dl_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+        const fileName = remotePath.split('\\').pop() || remotePath.split('/').pop() || 'download';
+        
+        const state = {
+            id: downloadId,
+            totalSize: 0,
+            receivedSize: 0,
+            chunks: [],
+            windowSize: 4,
+            onProgress: onProgress,
+            readyResolve: null,
+            doneResolve: null,
+            errorReject: null,
+            cancelled: false,
+            paused: false,
+            pauseResolve: null,
+            startTime: 0,
+        };
+        this._downloadState = state;
+
+        try {
+            await new Promise((resolve, reject) => {
+                state.readyResolve = resolve;
+                state.errorReject = reject;
+                const timeout = setTimeout(() => reject(new Error('download start timeout')), 30000);
+                state.errorReject = (err) => {
+                    clearTimeout(timeout);
+                    reject(err);
+                };
+                this.ws.send(JSON.stringify({
+                    action: 'download',
+                    sub: 'start',
+                    path: remotePath,
+                    id: downloadId,
+                }));
+            });
+
+            this.ws.send(JSON.stringify({
+                action: 'download',
+                sub: 'startack',
+                id: downloadId,
+                ack: state.windowSize,
+            }));
+            state.startTime = performance.now();
+
+            const result = await new Promise((resolve, reject) => {
+                state.doneResolve = resolve;
+                state.errorReject = reject;
+                setTimeout(() => reject(new Error('download timeout')), 300000);
+            });
+
+            if (onProgress) onProgress(100, 0, 'completed');
+
+            const blob = new Blob([result]);
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = fileName;
+            a.click();
+            URL.revokeObjectURL(a.href);
+        } finally {
+            this._downloadState = null;
         }
     }
 

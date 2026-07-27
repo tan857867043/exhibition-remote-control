@@ -1,7 +1,8 @@
-import React, { useState, useEffect, useRef, useCallback } from "react";
+import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import ExhibitionRemoteClient from "./lib/ExhibitionRemoteClient.js";
-import { Monitor, WifiOff, Settings, Mouse, Cast, Lock, Terminal, Router, X, Maximize, Minimize, ChevronLeft, Zap, Image as ImageIcon, Activity, FolderUp, UploadCloud, Download } from "lucide-react";
+import { Monitor, WifiOff, Settings, Mouse, Cast, Lock, Terminal, Router, X, Maximize, Minimize, ChevronLeft, Zap, Image as ImageIcon, Activity, Folder, UploadCloud, Download } from "lucide-react";
 import { FileTransferModal, TransferTask } from "./components/FileTransferModal";
+import { FileManager, TransferTaskItem } from "./components/FileManager";
 
 interface DeviceInfo {
   id: string;
@@ -44,24 +45,63 @@ export default function App() {
   const [targetDir, setTargetDir] = useState("C:\\Users\\Public\\Downloads");
   const [transferTasks, setTransferTasks] = useState<TransferTask[]>([]);
   const [isCanvasDragging, setIsCanvasDragging] = useState(false);
+  const [fileManagerOpen, setFileManagerOpen] = useState(false);
+  const [fileManagerMinimized, setFileManagerMinimized] = useState(false);
+  const [fmTransferTasks, setFmTransferTasks] = useState<TransferTaskItem[]>([]);
+
+  const totalProgress = useMemo(() => {
+    const totalSize = fmTransferTasks.reduce((sum, t) => sum + (t.size || 0), 0);
+    if (totalSize === 0) return { percent: 0, done: 0, total: 0 };
+    const doneSize = fmTransferTasks.reduce((sum, t) => {
+      if (t.status === "completed") return sum + (t.size || 0);
+      return sum + ((t.size || 0) * (t.progress || 0)) / 100;
+    }, 0);
+    const fmt = (b: number) => {
+      if (b < 1024) return b + " B";
+      if (b < 1024 * 1024) return (b / 1024).toFixed(1) + " KB";
+      if (b < 1024 * 1024 * 1024) return (b / 1024 / 1024).toFixed(1) + " MB";
+      return (b / 1024 / 1024 / 1024).toFixed(2) + " GB";
+    };
+    return {
+      percent: Math.round((doneSize / totalSize) * 100),
+      done: doneSize,
+      total: totalSize,
+      doneStr: fmt(doneSize),
+      totalStr: fmt(totalSize),
+    };
+  }, [fmTransferTasks]);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const clientRef = useRef<any>(null);
 
-  const handleSendFiles = async (files: FileList | File[], dir: string) => {
+  const handleSendFiles = async (files: FileList | File[], dir: string, overwriteMode: string, applyToAll: boolean, directories?: string[]) => {
     if (!clientRef.current) {
       alert("请先连接到远程设备");
       return;
     }
     const fileArray = Array.from(files);
+
+    // Send create_dir messages for directory structure before file transfers
+    if (directories && directories.length > 0 && clientRef.current.ws && clientRef.current.ws.readyState === WebSocket.OPEN) {
+      for (const dirPath of directories) {
+        clientRef.current.ws.send(JSON.stringify({ action: "create_dir", path: `${dir}\\${dirPath}` }));
+      }
+    }
+
+    // Map overwrite mode to string for Agent
+    const ov = overwriteMode === "skip" ? "skip" : overwriteMode === "overwrite" ? "overwrite" : "rename";
+
     for (const file of fileArray) {
       const taskId = `task_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+      // 保留拖拽文件夹的相对路径结构
+      const relPath = (file as any)._relativePath;
+      const fileTargetDir = relPath ? `${dir}\\${relPath}` : dir;
       const newTask: TransferTask = {
         id: taskId,
-        fileName: file.name,
+        fileName: relPath ? `${relPath}\\${file.name}` : file.name,
         fileSize: file.size,
-        targetDir: dir,
+        targetDir: fileTargetDir,
         progress: 0,
         speedMBs: 0,
         status: "transferring",
@@ -73,7 +113,8 @@ export default function App() {
       try {
         await clientRef.current.sendFile(
           file,
-          dir,
+          fileTargetDir,
+          { overwrite: ov },
           (progress: number, speedMBs: number, status: string) => {
             setTransferTasks((prev) =>
               prev.map((t) =>
@@ -82,7 +123,7 @@ export default function App() {
                       ...t,
                       progress,
                       speedMBs,
-                      status: status === "completed" ? "completed" : "transferring",
+                      status: status === "completed" ? "completed" : status === "skipped" ? "skipped" : "transferring",
                     }
                   : t
               )
@@ -100,6 +141,22 @@ export default function App() {
         );
       }
     }
+  };
+
+  const handleRetryFile = (task: TransferTask) => {
+    // Re-add the failed/skipped file to the queue
+    if (!clientRef.current) {
+      alert("请先连接到远程设备");
+      return;
+    }
+    // Mark the old task as pending and let the queue process it
+    setTransferTasks((prev) =>
+      prev.map((t) =>
+        t.id === task.id
+          ? { ...t, status: "pending" as const, progress: 0, speedMBs: 0, error: undefined }
+          : t
+      )
+    );
   };
 
   const handleCanvasDragOver = (e: React.DragEvent) => {
@@ -120,7 +177,7 @@ export default function App() {
     setIsCanvasDragging(false);
     if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
       setFileModalOpen(true);
-      handleSendFiles(e.dataTransfer.files, targetDir);
+      handleSendFiles(e.dataTransfer.files, targetDir, "skip", false);
     }
   };
   
@@ -185,6 +242,7 @@ export default function App() {
 
     setCurrentDeviceId(deviceId);
     setViewMode("remote");
+    setStatus("connecting");
     
     // We need to wait for the view to render the canvas before initializing the client
     setTimeout(() => {
@@ -198,13 +256,27 @@ export default function App() {
             setKeyboardCaptured(stats.captured);
           }
         });
+        // Override ws.onclose to mark transferring tasks as failed on disconnect
+        if (clientRef.current.ws) {
+          const origOnClose = clientRef.current.ws.onclose;
+          clientRef.current.ws.onclose = (e: CloseEvent) => {
+            if (origOnClose) origOnClose.call(clientRef.current.ws, e);
+            setTransferTasks((prev) =>
+              prev.map((t) =>
+                t.status === "transferring"
+                  ? { ...t, status: "failed" as const, error: "网络中断" }
+                  : t
+              )
+            );
+          };
+        }
+        setStatus("connected");
       }
     }, 100);
 
     fpsCounterRef.current = 0;
     bytesReceivedRef.current = 0;
     blockCounterRef.current = 0;
-    setStatus("connected");
   };
 
   const disconnectDevice = () => {
@@ -534,15 +606,17 @@ export default function App() {
             </div>
 
             <div className="flex items-center gap-3 pointer-events-auto">
+
               <button 
-                onClick={() => setFileModalOpen(true)}
-                className="px-3 py-1.5 bg-blue-600/90 hover:bg-blue-500 text-white rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 shadow-md shadow-blue-500/20 active:scale-95"
-                title="文件传输"
+                onClick={() => { setFileManagerOpen(true); setFileManagerMinimized(false); }}
+                className="p-1.5 hover:bg-slate-700/50 rounded text-slate-400 relative"
+                title="文件管理器"
               >
-                <FolderUp className="w-4 h-4" />
-                <span>文件传输</span>
-                {transferTasks.some(t => t.status === "transferring") && (
-                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                <Folder className="w-4 h-4" />
+                {fmTransferTasks.filter(t => t.status === "transferring").length > 0 && (
+                  <span className="absolute -top-0.5 -right-0.5 w-3.5 h-3.5 bg-indigo-500 rounded-full text-[8px] text-white font-bold flex items-center justify-center">
+                    {fmTransferTasks.filter(t => t.status === "transferring").length}
+                  </span>
                 )}
               </button>
 
@@ -596,7 +670,65 @@ export default function App() {
               </div>
             )}
             
-            <div className="absolute bottom-6 right-6 flex gap-2 pointer-events-none z-30 opacity-70">
+            <div className="absolute bottom-6 right-6 flex flex-col gap-2 pointer-events-none z-30 items-end">
+              {fileManagerMinimized && (
+                <div className="pointer-events-auto bg-slate-900/95 backdrop-blur border border-indigo-500/40 rounded-lg shadow-2xl overflow-hidden cursor-pointer hover:bg-slate-800 transition-colors min-w-[280px]"
+                  onClick={() => setFileManagerMinimized(false)}>
+                  <div className="flex items-center gap-2 px-3 py-2 border-b border-slate-700">
+                    <Folder className="w-4 h-4 text-indigo-400" />
+                    <span className="text-xs font-bold text-slate-200">
+                      {fmTransferTasks.length > 0 ? "文件传输中（点击展开）" : "文件管理器（点击展开）"}
+                    </span>
+                    {fmTransferTasks.filter(t => t.status === "transferring").length > 0 && (
+                      <span className="text-[10px] text-indigo-400 ml-auto font-bold">
+                        {fmTransferTasks.filter(t => t.status === "transferring").length} 个进行中
+                      </span>
+                    )}
+                  </div>
+                  {fmTransferTasks.length > 0 && (
+                    <div className="px-3 py-2 border-b border-slate-700 bg-slate-800/30">
+                      <div className="flex items-center justify-between text-[11px] mb-1">
+                        <span className="text-slate-400 font-medium">总进度</span>
+                        <span className="text-indigo-400 font-mono font-bold">
+                          {totalProgress.percent}% · {totalProgress.doneStr} / {totalProgress.totalStr}
+                        </span>
+                      </div>
+                      <div className="w-full h-1.5 bg-slate-700 rounded-full overflow-hidden">
+                        <div className="h-full bg-gradient-to-r from-indigo-500 to-indigo-400 rounded-full transition-all"
+                          style={{ width: `${totalProgress.percent}%` }} />
+                      </div>
+                    </div>
+                  )}
+                  <div className="max-h-48 overflow-y-auto">
+                    {fmTransferTasks.length === 0 ? (
+                      <div className="px-3 py-4 text-center text-[11px] text-slate-500">暂无传输任务</div>
+                    ) : fmTransferTasks.slice(0, 5).map(task => (
+                      <div key={task.id} className="px-3 py-1.5 border-b border-slate-800/50 last:border-b-0">
+                        <div className="flex items-center gap-2 text-[11px]">
+                          {task.direction === "upload" ? (
+                            <UploadCloud className="w-3 h-3 text-blue-400 shrink-0" />
+                          ) : (
+                            <Download className="w-3 h-3 text-emerald-400 shrink-0" />
+                          )}
+                          <span className="text-slate-300 truncate flex-1">{task.name}</span>
+                          <span className={`shrink-0 font-mono ${
+                            task.status === "completed" ? "text-emerald-400" :
+                            task.status === "failed" ? "text-red-400" :
+                            "text-slate-400"
+                          }`}>{task.progress}%</span>
+                        </div>
+                        <div className="w-full h-1 bg-slate-700 rounded-full mt-1 overflow-hidden">
+                          <div className={`h-full rounded-full transition-all ${
+                            task.status === "completed" ? "bg-emerald-500" :
+                            task.status === "failed" ? "bg-red-500" :
+                            "bg-indigo-500"
+                          }`} style={{ width: `${task.progress}%` }} />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
               <div className="bg-slate-900/80 backdrop-blur border border-slate-800 px-3 py-1.5 rounded text-[10px] text-slate-300 font-bold flex items-center gap-2">
                 {keyboardCaptured ? <span className="text-emerald-400">⌨️ 已捕获</span> : "⌨️ 未捕获"}
               </div>
@@ -614,7 +746,14 @@ export default function App() {
         onSendFiles={handleSendFiles}
         tasks={transferTasks}
         onClearHistory={() => setTransferTasks([])}
+        onRetryFile={handleRetryFile}
       />
+
+      <FileManager isOpen={fileManagerOpen && status === "connected" && !fileManagerMinimized}
+        onClose={() => { setFileManagerOpen(false); setFileManagerMinimized(false); setFmTransferTasks([]); }}
+        onMinimize={() => setFileManagerMinimized(true)}
+        onTasksChange={setFmTransferTasks}
+        clientRef={clientRef} deviceName={currentDeviceId ? getDeviceName(currentDeviceId) : ""} />
     </div>
   );
 }
