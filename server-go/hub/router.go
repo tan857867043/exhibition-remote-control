@@ -48,6 +48,8 @@ func handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 		log.Println("Upgrade error:", err)
 		return
 	}
+	conn.SetReadLimit(10 * 1024 * 1024) // 10MB，允许大文件分块
+
 	deviceID := r.URL.Query().Get("device_id")
 	deviceName := r.URL.Query().Get("device_name")
 	deviceOS := r.URL.Query().Get("os")
@@ -58,6 +60,11 @@ func handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 	if deviceID == "" {
 		conn.Close()
 		return
+	}
+
+	// TCP_NODELAY: 降低网络延迟
+	if tcp, ok := conn.UnderlyingConn().(*net.TCPConn); ok {
+		tcp.SetNoDelay(true)
 	}
 
 	GlobalHub.mu.Lock()
@@ -96,17 +103,38 @@ func handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 				copy(frame, payload)
 				GlobalHub.LatestFrame[deviceID] = frame
 				GlobalHub.mu.Unlock()
-			}
-			GlobalHub.mu.RLock()
-			subs := GlobalHub.Subscribers[deviceID]
-			for subConn := range subs {
-				// 异步无阻塞流式转发原始二进制画面块
-				err := subConn.WriteMessage(websocket.BinaryMessage, payload)
-				if err != nil {
-					log.Println("Write error to sub:", err)
+				// 通过缓冲通道异步转发，防止慢订阅者阻塞 Agent 读取循环
+				GlobalHub.mu.RLock()
+				subs := GlobalHub.Subscribers[deviceID]
+				channels := GlobalHub.SubscriberChannels[deviceID]
+				for subConn := range subs {
+					if ch, ok := channels[subConn]; ok {
+						select {
+						case ch <- payload:
+							// 正常发送
+						default:
+							// 通道满：drain 掉最旧的帧，然后推送最新的
+							select {
+							case <-ch:
+							default:
+							}
+							select {
+							case ch <- payload:
+							default:
+							}
+						}
+					}
 				}
+				GlobalHub.mu.RUnlock()
+			} else {
+				// 非视频二进制消息（如下载分块 0x01 等）直接转发给订阅者
+				GlobalHub.mu.RLock()
+				subs := GlobalHub.Subscribers[deviceID]
+				for subConn := range subs {
+					subConn.WriteMessage(websocket.BinaryMessage, payload)
+				}
+				GlobalHub.mu.RUnlock()
 			}
-			GlobalHub.mu.RUnlock()
 		} else if messageType == websocket.TextMessage {
 			displayLen := len(payload)
 			if displayLen > 200 {
@@ -207,7 +235,17 @@ func handleStreamSubscribe(w http.ResponseWriter, r *http.Request) {
 		log.Println("Upgrade error:", err)
 		return
 	}
+	conn.SetReadLimit(10 * 1024 * 1024) // 10MB 读取限制，允许大文件分块传输
+
+	// TCP_NODELAY: 降低网络延迟
+	if tcp, ok := conn.UnderlyingConn().(*net.TCPConn); ok {
+		tcp.SetNoDelay(true)
+	}
+
 	deviceID := r.URL.Query().Get("device_id")
+
+	// 创建缓冲通道（容量4），足够吸收瞬发爆发帧，满了就 drain 旧帧保持最新
+	ch := make(chan []byte, 4)
 
 	GlobalHub.mu.Lock()
 	wasEmpty := len(GlobalHub.Subscribers[deviceID]) == 0
@@ -215,7 +253,26 @@ func handleStreamSubscribe(w http.ResponseWriter, r *http.Request) {
 		GlobalHub.Subscribers[deviceID] = make(map[*websocket.Conn]bool)
 	}
 	GlobalHub.Subscribers[deviceID][conn] = true
+
+	if GlobalHub.SubscriberChannels[deviceID] == nil {
+		GlobalHub.SubscriberChannels[deviceID] = make(map[*websocket.Conn]chan []byte)
+	}
+	GlobalHub.SubscriberChannels[deviceID][conn] = ch
 	GlobalHub.mu.Unlock()
+
+	// 启动独立 goroutine 从缓冲通道读取并写入 WebSocket（带 recover 防止崩溃）
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Println("[Hub] Recovered in subscriber writer:", r)
+			}
+		}()
+		for payload := range ch {
+			if err := conn.WriteMessage(websocket.BinaryMessage, payload); err != nil {
+				break
+			}
+		}
+	}()
 
 	// 第一个订阅者连接时通知 Agent 恢复截图
 	if wasEmpty {
@@ -243,6 +300,14 @@ func handleStreamSubscribe(w http.ResponseWriter, r *http.Request) {
 			if len(GlobalHub.Subscribers[deviceID]) == 0 {
 				delete(GlobalHub.Subscribers, deviceID)
 				becameEmpty = true
+			}
+		}
+		// 清理通道并关闭
+		if ch, ok := GlobalHub.SubscriberChannels[deviceID][conn]; ok {
+			close(ch)
+			delete(GlobalHub.SubscriberChannels[deviceID], conn)
+			if len(GlobalHub.SubscriberChannels[deviceID]) == 0 {
+				delete(GlobalHub.SubscriberChannels, deviceID)
 			}
 		}
 		GlobalHub.mu.Unlock()
@@ -274,6 +339,8 @@ func handleStreamSubscribe(w http.ResponseWriter, r *http.Request) {
 					displayLen = 200
 				}
 				log.Printf("[Hub] Subscriber for %s sent text: %s", deviceID, string(payload[:displayLen]))
+			} else {
+				log.Printf("[Hub] Subscriber for %s sent binary (%d bytes, type=0x%02X)", deviceID, len(payload), payload[0])
 			}
 			GlobalHub.mu.RLock()
 			agentConn, exists := GlobalHub.Agents[deviceID]
@@ -292,8 +359,12 @@ var exeConfigGUID = []byte{0xB9, 0x96, 0x01, 0x58, 0x80, 0x54, 0x4A, 0x19, 0xB7,
 func getLocalIP() string {
 	ifaces, err := net.Interfaces()
 	if err != nil {
+		log.Println("[getLocalIP] Failed to get interfaces:", err)
 		return "127.0.0.1"
 	}
+
+	// 按优先级收集：先找局域网 IP（192.168/10.x），排除 Docker 虚拟 IP
+	var fallback string
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 			continue
@@ -310,18 +381,51 @@ func getLocalIP() string {
 			case *net.IPAddr:
 				ip = v.IP
 			}
-			if ip != nil && ip.To4() != nil {
-				return ip.String()
+			if ip == nil || ip.To4() == nil {
+				continue
+			}
+			ip = ip.To4() // 转为 4 字节 IPv4，否则 ip[0]/ip[1] 读的是 16 字节映射格式
+			s := ip.String()
+			// 跳过 Docker 虚拟 IP（172.17-31.x.x）
+			if ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31 {
+				log.Printf("[getLocalIP] skipping Docker IP: %s (iface: %s)", s, iface.Name)
+				continue
+			}
+			// 跳过 169.254.x.x（链路本地）
+			if ip[0] == 169 && ip[1] == 254 {
+				log.Printf("[getLocalIP] skipping link-local IP: %s (iface: %s)", s, iface.Name)
+				continue
+			}
+			// 优先返回 192.168.x.x
+			if ip[0] == 192 && ip[1] == 168 {
+				log.Printf("[getLocalIP] selected LAN IP: %s (iface: %s)", s, iface.Name)
+				return s
+			}
+			// 其次 10.x.x.x
+			if ip[0] == 10 {
+				log.Printf("[getLocalIP] selected LAN IP: %s (iface: %s)", s, iface.Name)
+				return s
+			}
+			// 其他非虚拟 IP 作为备选
+			if fallback == "" {
+				log.Printf("[getLocalIP] fallback IP: %s (iface: %s)", s, iface.Name)
+				fallback = s
 			}
 		}
 	}
+	if fallback != "" {
+		log.Printf("[getLocalIP] using fallback IP: %s", fallback)
+		return fallback
+	}
+	log.Println("[getLocalIP] no suitable IP found, returning 127.0.0.1")
 	return "127.0.0.1"
 }
 
 func handleAgentDownload(w http.ResponseWriter, r *http.Request) {
-	exePath := filepath.Join("..", "agent-rust", "target", "release", "exhibition-agent.exe")
+	hubDir := filepath.Dir(os.Args[0])
+	exePath := filepath.Join(hubDir, "..", "agent-rust", "target", "release", "exhibition-agent.exe")
 	if _, err := os.Stat(exePath); os.IsNotExist(err) {
-		exePath = filepath.Join("..", "agent-rust", "target", "debug", "exhibition-agent.exe")
+		exePath = filepath.Join(hubDir, "..", "agent-rust", "target", "debug", "exhibition-agent.exe")
 		if _, err := os.Stat(exePath); os.IsNotExist(err) {
 			w.WriteHeader(http.StatusNotFound)
 			w.Write([]byte("Agent exe not found"))

@@ -6,14 +6,15 @@ mod config;
 use capture::ScreenCapturer;
 use dirty_rect::GridManager;
 use encoder::{build_binary_packet, extract_block_rgba_into, downsample_bgra_2x};
-use enigo::{Enigo, MouseControllable, MouseButton, KeyboardControllable, Key};
+use enigo::{Enigo, MouseControllable, MouseButton};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use sha2::{Sha256, Digest};
-use std::collections::VecDeque;
+use xxhash_rust::xxh64::xxh64;
+use std::collections::{VecDeque, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, AtomicBool, AtomicI32, Ordering};
+use std::sync::{Mutex, LazyLock, OnceLock};
 use std::fs::File;
 use std::io::{Read, Write};
 use sysinfo::System;
@@ -39,6 +40,60 @@ extern "system" {
         lpFileSystemNameBuffer: *mut u16,
         nFileSystemNameSize: u32,
     ) -> i32;
+}
+
+#[cfg(windows)]
+use windows::Win32::UI::Input::KeyboardAndMouse::*;
+#[cfg(windows)]
+use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, PM_NOREMOVE};
+
+#[cfg(windows)]
+fn send_input_raw(inputs: &[INPUT]) {
+    let result = unsafe {
+        SendInput(inputs, std::mem::size_of::<INPUT>() as i32)
+    };
+    if result == 0 {
+    }
+}
+
+#[cfg(windows)]
+fn send_key(vk: u16, action: u8) {
+    // Initialize message queue for current thread (required by SendInput for reliability)
+    static MSG_QUEUE_INIT: OnceLock<()> = OnceLock::new();
+    MSG_QUEUE_INIT.get_or_init(|| {
+        unsafe {
+            let mut msg = std::mem::zeroed();
+            let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
+        }
+    });
+
+    // Convert VK to hardware scan code (Ghost-Keys/Kanata approach for trusted input)
+    let scan = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) } as u16;
+    println!("[KEY] send_key vk=0x{:02X} scan=0x{:02X} action={}", vk, scan, action);
+    let mut flags = KEYEVENTF_SCANCODE;
+    if action == 1 { flags |= KEYEVENTF_KEYUP; }
+    // Extended keys need KEYEVENTF_EXTENDEDKEY (arrows, PgUp/Dn, Home/End, Ins/Del, RCtrl, RAlt, NumLk, Numpad/)
+    let extended = [0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E, 0x6F, 0x90, 0xA3, 0xA5];
+    if extended.contains(&vk) { flags |= KEYEVENTF_EXTENDEDKEY; }
+
+    let input = INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(0),
+                wScan: scan,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    send_input_raw(&[input]);
+}
+
+#[cfg(windows)]
+fn send_key_down_up(vk: u16, down: bool) {
+    send_key(vk, if down { 0 } else { 1 });
 }
 
 #[cfg(windows)]
@@ -120,6 +175,8 @@ fn get_disk_info_windows(_root: &str) -> (u64, u64, String, String) {
 static CPU_LOAD: AtomicU32 = AtomicU32::new(0);
 // 截图暂停标志（无订阅者时暂停截图以节省资源）
 static CAPTURE_PAUSED: AtomicBool = AtomicBool::new(false);
+// 画质档位（前端控制: 30=流畅, 50=均衡, 75=高清）
+static QUALITY_PROFILE: AtomicI32 = AtomicI32::new(50);
 
 // 文件传输状态
 struct FileTransfer {
@@ -155,6 +212,7 @@ struct UploadStateV2 {
     done: bool,
 }
 static UPLOAD_STATE_V2: Mutex<Option<UploadStateV2>> = Mutex::new(None);
+static PRESSED_KEYS: LazyLock<Mutex<HashSet<u16>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 #[derive(Deserialize, Debug)]
 struct ControlCmd {
@@ -166,6 +224,7 @@ struct ControlCmd {
     button: Option<String>,
     key: Option<String>,
     key_code: Option<u16>,
+    value: Option<i32>,
 }
 
 // === 自适应画质引擎（参照 RDP/VNC 做法）===
@@ -204,10 +263,10 @@ impl QualityEngine {
 
         if change_ratio > 0.40 {
             self.framerate = 30;
-            self.quality = (self.quality - 2).max(80);
+            self.quality = (self.quality - 2).max(self.min_quality);
         } else if change_ratio > 0.15 {
             self.framerate = 30;
-            self.quality = (self.quality - 1).max(80);
+            self.quality = (self.quality - 1).max(self.min_quality);
         } else if change_ratio > 0.02 {
             self.framerate = 30;
             self.quality = (self.quality + 1).min(self.max_quality);
@@ -244,6 +303,8 @@ impl QualityEngine {
             self.quality = (self.quality - 5).max(self.min_quality);
         }
 
+        // 最终 clamp 到档位边界内，确保任何路径都不会越界
+        self.quality = self.quality.clamp(self.min_quality, self.max_quality);
         self.framerate = self.framerate.max(1);
     }
 
@@ -259,70 +320,40 @@ impl QualityEngine {
     }
 }
 
-fn map_key(key_str: &str) -> Option<Key> {
+fn text_key_to_vk(key_str: &str) -> Option<u16> {
     match key_str {
-        "Enter" => Some(Key::Return),
-        "Tab" => Some(Key::Tab),
-        " " | "Space" => Some(Key::Space),
-        "Backspace" => Some(Key::Backspace),
-        "Escape" => Some(Key::Escape),
-        "Delete" => Some(Key::Delete),
-        "Insert" => Some(Key::Insert),
-        "Home" => Some(Key::Home),
-        "End" => Some(Key::End),
-        "PageUp" => Some(Key::PageUp),
-        "PageDown" => Some(Key::PageDown),
-        "ArrowUp" => Some(Key::UpArrow),
-        "ArrowDown" => Some(Key::DownArrow),
-        "ArrowLeft" => Some(Key::LeftArrow),
-        "ArrowRight" => Some(Key::RightArrow),
-        "Shift" => Some(Key::Shift),
-        "Control" => Some(Key::Control),
-        "Alt" => Some(Key::Alt),
-        "Meta" | "OS" => Some(Key::Meta),
-        "CapsLock" => Some(Key::CapsLock),
-        s if s.len() == 1 => Some(Key::Layout(s.chars().next().unwrap())),
-        "F1" => Some(Key::F1), "F2" => Some(Key::F2), "F3" => Some(Key::F3),
-        "F4" => Some(Key::F4), "F5" => Some(Key::F5), "F6" => Some(Key::F6),
-        "F7" => Some(Key::F7), "F8" => Some(Key::F8), "F9" => Some(Key::F9),
-        "F10" => Some(Key::F10), "F11" => Some(Key::F11), "F12" => Some(Key::F12),
+        "Enter" => Some(0x0D),
+        "Tab" => Some(0x09),
+        " " | "Space" => Some(0x20),
+        "Backspace" => Some(0x08),
+        "Escape" => Some(0x1B),
+        "Delete" => Some(0x2E),
+        "Insert" => Some(0x2D),
+        "Home" => Some(0x24),
+        "End" => Some(0x23),
+        "PageUp" => Some(0x21),
+        "PageDown" => Some(0x22),
+        "ArrowUp" => Some(0x26),
+        "ArrowDown" => Some(0x28),
+        "ArrowLeft" => Some(0x25),
+        "ArrowRight" => Some(0x27),
+        "Shift" => Some(0x10),
+        "Control" => Some(0x11),
+        "Alt" => Some(0x12),
+        "Meta" | "OS" => Some(0x5B),
+        "CapsLock" => Some(0x14),
+        s if s.len() == 1 => Some(s.chars().next().unwrap() as u16),
+        "F1" => Some(0x70), "F2" => Some(0x71), "F3" => Some(0x72),
+        "F4" => Some(0x73), "F5" => Some(0x74), "F6" => Some(0x75),
+        "F7" => Some(0x76), "F8" => Some(0x77), "F9" => Some(0x78),
+        "F10" => Some(0x79), "F11" => Some(0x7A), "F12" => Some(0x7B),
         _ => None,
     }
 }
 
-fn vk_to_key(vk: u16) -> Option<Key> {
-    match vk {
-        0x41..=0x5A => Some(Key::Layout((b'A' + (vk - 0x41) as u8) as char)),
-        0x30..=0x39 => Some(Key::Layout((b'0' + (vk - 0x30) as u8) as char)),
-        0x08 => Some(Key::Backspace),
-        0x09 => Some(Key::Tab),
-        0x0D => Some(Key::Return),
-        0x10 | 0xA0 | 0xA1 => Some(Key::Shift),
-        0x11 | 0xA2 | 0xA3 => Some(Key::Control),
-        0x12 | 0xA4 | 0xA5 => Some(Key::Alt),
-        0x5B | 0x5C => Some(Key::Meta),
-        0x1B => Some(Key::Escape),
-        0x20 => Some(Key::Space),
-        0x21 => Some(Key::PageUp),
-        0x22 => Some(Key::PageDown),
-        0x23 => Some(Key::End),
-        0x24 => Some(Key::Home),
-        0x25 => Some(Key::LeftArrow),
-        0x26 => Some(Key::UpArrow),
-        0x27 => Some(Key::RightArrow),
-        0x28 => Some(Key::DownArrow),
-        0x2D => Some(Key::Insert),
-        0x2E => Some(Key::Delete),
-        0x14 => Some(Key::CapsLock),
-        0x70 => Some(Key::F1), 0x71 => Some(Key::F2), 0x72 => Some(Key::F3),
-        0x73 => Some(Key::F4), 0x74 => Some(Key::F5), 0x75 => Some(Key::F6),
-        0x76 => Some(Key::F7), 0x77 => Some(Key::F8), 0x78 => Some(Key::F9),
-        0x79 => Some(Key::F10), 0x7A => Some(Key::F11), 0x7B => Some(Key::F12),
-        _ => None,
-    }
-}
 
-fn send_download_chunk(file_tx: &tokio::sync::mpsc::Sender<Message>) {
+
+fn send_download_chunk(ack_tx: &tokio::sync::mpsc::Sender<Message>) {
     let mut ds = DOWNLOAD_STATE.lock().unwrap();
     let state = match &mut *ds {
         Some(s) => s,
@@ -352,7 +383,7 @@ fn send_download_chunk(file_tx: &tokio::sync::mpsc::Sender<Message>) {
     packet.extend_from_slice(&header.to_be_bytes());
     packet.extend_from_slice(&buffer);
 
-    if file_tx.try_send(Message::Binary(packet)).is_err() {
+    if ack_tx.try_send(Message::Binary(packet)).is_err() {
         return;
     }
 
@@ -404,23 +435,31 @@ fn handle_binary_msg(enigo: &mut Enigo, data: &[u8], ack_tx: &tokio::sync::mpsc:
                 let action = data[offset];
                 let vk = data[offset + 1] as u16 | ((data[offset + 2] as u16) << 8);
                 offset += 3;
-                if let Some(key) = vk_to_key(vk) {
-                    if action == 0 {
-                        enigo.key_down(key);
-                    } else {
-                        enigo.key_up(key);
-                    }
+
+                // Track pressed keys
+                if action == 0 || action == 2 {
+                    PRESSED_KEYS.lock().unwrap().insert(vk);
+                } else {
+                    PRESSED_KEYS.lock().unwrap().remove(&vk);
                 }
+
+                // Send raw keyboard event via windows crate
+                #[cfg(windows)]
+                send_key(vk, action);
             }
         }
         0x05 => {
             if data.len() < 2 { return; }
             if data[1] == 10 {
-                enigo.key_down(Key::Control);
-                enigo.key_down(Key::Alt);
-                enigo.key_click(Key::Delete);
-                enigo.key_up(Key::Alt);
-                enigo.key_up(Key::Control);
+                #[cfg(windows)]
+                {
+                    send_key_down_up(0x11, true);  // Ctrl down
+                    send_key_down_up(0x12, true);  // Alt down
+                    send_key_down_up(0x2E, true);  // Delete down
+                    send_key_down_up(0x2E, false); // Delete up
+                    send_key_down_up(0x12, false); // Alt up
+                    send_key_down_up(0x11, false); // Ctrl up
+                }
             }
         }
         0x06 => {
@@ -665,6 +704,11 @@ async fn main() {
 
     println!("Connecting to hub at {}", url);
     let (ws_stream, _) = tokio_tungstenite::connect_async(url).await.expect("Failed to connect");
+    // TCP_NODELAY: 禁用 Nagle 算法，降低网络延迟（ws:// 连接为 Plain TcpStream）
+    use tokio_tungstenite::MaybeTlsStream;
+    if let MaybeTlsStream::Plain(tcp) = ws_stream.get_ref() {
+        let _ = tcp.set_nodelay(true);
+    }
     let (mut write, mut read) = ws_stream.split();
 
     // === 优先级队列：高优(视频+控制) + 低优(文件传输) ===
@@ -724,12 +768,15 @@ async fn main() {
         while let Some(msg) = read.next().await {
             match msg {
                 Ok(Message::Binary(data)) => {
-                    handle_binary_msg(&mut enigo, &data, &ack_tx);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        handle_binary_msg(&mut enigo, &data, &ack_tx);
+                    }));
+                    if let Err(e) = result {
+                        eprintln!("[Agent] handle_binary_msg panic (已恢复): {:?}", e);
+                    }
                 }
                 Ok(Message::Text(text)) => {
-                println!("[Agent] Received text: {}", text);
                 if let Ok(cmd) = serde_json::from_str::<ControlCmd>(&text) {
-                    println!("[Agent] Parsed action: {}", cmd.action);
                     match cmd.action.as_str() {
                         "mouse_move" => {
                             if let (Some(x), Some(y)) = (cmd.x, cmd.y) {
@@ -768,17 +815,67 @@ async fn main() {
                                 enigo.mouse_scroll_y(delta);
                             }
                         }
+                        "key" => {
+                            #[derive(Deserialize)]
+                            struct KeyCmd { vk: u16, down: bool }
+                            if let Ok(kc) = serde_json::from_str::<KeyCmd>(&text) {
+                                println!("[KEY] vk=0x{:02X} down={}", kc.vk, kc.down);
+                                #[cfg(windows)]
+                                send_key(kc.vk, if kc.down { 0 } else { 1 });
+                            } else {
+                                println!("[KEY] parse KeyCmd FAILED from: {}", text);
+                            }
+                        }
+                        "keyboard" => {
+                            if let Some(vk) = cmd.x {
+                                let action = cmd.y.unwrap_or(0);
+                                #[cfg(windows)]
+                                send_key(vk as u16, action as u8);
+                            } else {
+                            }
+                        }
                         "key_press" => {
                             if let Some(ref key_str) = cmd.key {
-                                if let Some(key) = map_key(key_str) {
-                                    enigo.key_down(key);
+                                if let Some(vk) = text_key_to_vk(key_str) {
+                                    #[cfg(windows)]
+                                    {
+                                        let flags = KEYBD_EVENT_FLAGS(0);
+                                        let input = INPUT {
+                                            r#type: INPUT_KEYBOARD,
+                                            Anonymous: INPUT_0 {
+                                                ki: KEYBDINPUT {
+                                                    wVk: VIRTUAL_KEY(vk),
+                                                    wScan: 0,
+                                                    dwFlags: flags,
+                                                    time: 0,
+                                                    dwExtraInfo: 0,
+                                                },
+                                            },
+                                        };
+                                        send_input_raw(&[input]);
+                                    }
                                 }
                             }
                         }
                         "key_release" => {
                             if let Some(ref key_str) = cmd.key {
-                                if let Some(key) = map_key(key_str) {
-                                    enigo.key_up(key);
+                                if let Some(vk) = text_key_to_vk(key_str) {
+                                    #[cfg(windows)]
+                                    {
+                                        let input = INPUT {
+                                            r#type: INPUT_KEYBOARD,
+                                            Anonymous: INPUT_0 {
+                                                ki: KEYBDINPUT {
+                                                    wVk: VIRTUAL_KEY(vk),
+                                                    wScan: 0,
+                                                    dwFlags: KEYEVENTF_KEYUP,
+                                                    time: 0,
+                                                    dwExtraInfo: 0,
+                                                },
+                                            },
+                                        };
+                                        send_input_raw(&[input]);
+                                    }
                                 }
                             }
                         }
@@ -789,6 +886,12 @@ async fn main() {
                         "resume" => {
                             CAPTURE_PAUSED.store(false, Ordering::Relaxed);
                             println!("Capture resumed (subscriber connected)");
+                        }
+                        "quality" => {
+                            if let Some(value) = cmd.value {
+                                QUALITY_PROFILE.store(value, Ordering::Relaxed);
+                                println!("Quality profile set to {}", value);
+                            }
                         }
                         "file_init" => {
                             // 解析文件传输初始化参数
@@ -1203,7 +1306,7 @@ async fn main() {
                                             state.window_size = window_size;
                                             drop(ds);
                                             for _ in 0..window_size {
-                                                send_download_chunk(&file_tx);
+                                                send_download_chunk(&ack_tx);
                                             }
                                         }
                                     }
@@ -1222,7 +1325,7 @@ async fn main() {
                                             let finished = state.finished;
                                             drop(ds);
                                             if !finished && in_flight < window_size {
-                                                send_download_chunk(&file_tx);
+                                                send_download_chunk(&ack_tx);
                                             }
                                         }
                                     }
@@ -1401,6 +1504,27 @@ async fn main() {
                 _ => {}
             }
         }
+
+        // Release all pressed keys on disconnect
+        let pressed = PRESSED_KEYS.lock().unwrap().drain().collect::<Vec<_>>();
+        for vk in pressed {
+            #[cfg(windows)]
+            {
+                let input = INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: VIRTUAL_KEY(vk),
+                            wScan: 0,
+                            dwFlags: KEYEVENTF_KEYUP,
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                };
+                send_input_raw(&[input]);
+            }
+        }
     });
 
     // === 优化2: 预分配可复用 buffer，避免高频 malloc ===
@@ -1410,6 +1534,8 @@ async fn main() {
     // === 核心优化: 将繁重的 CPU 捕获和压缩剥离到独立的 OS 线程 ===
     // 这样就不会阻塞 Tokio 的异步网络 I/O（WebSocket 读写可以极速响应）
     std::thread::spawn(move || {
+        // xxhash64 上一帧哈希，用于静态帧跳过
+        let mut prev_frame_hash: u64 = 0;
         // 主循环：捕获→检测→自适应→编码→非阻塞发送
         loop {
             // 无订阅者时暂停截图以节省 CPU/带宽
@@ -1421,6 +1547,16 @@ async fn main() {
             let frame_start = std::time::Instant::now();
 
             if let Some(frame_data) = capturer.capture_frame() {
+                // === xxhash64 全帧哈希静态帧跳过 ===
+                // 画面无变化时跳过编码/发送全部流程，大幅降低 CPU/带宽
+                let frame_hash = xxh64(&frame_data, 0);
+                if frame_hash == prev_frame_hash {
+                    // 静态帧：等 33ms 后再检查（避免空转）
+                    std::thread::sleep(std::time::Duration::from_millis(33));
+                    continue;
+                }
+                prev_frame_hash = frame_hash;
+
                 let (dirty_blocks, change_ratio) = grid_mgr.detect_dirty_blocks(&frame_data);
 
                 // === 优化3: 从 AtomicU32 读取节流后的 CPU 负载 ===
@@ -1430,6 +1566,26 @@ async fn main() {
                 let _is_static = change_ratio < 0.02;
                 let force_key = quality_engine.need_keyframe();
                 first_frame = false;
+
+                // === 应用前端画质档位 ===
+                // 在 adapt() 之前设置 min/max，让自动引擎在档位范围内动态调节
+                let profile = QUALITY_PROFILE.load(Ordering::Relaxed);
+                match profile {
+                    30 => { // 流畅
+                        quality_engine.min_quality = 50;
+                        quality_engine.max_quality = 65;
+                    }
+                    75 => { // 高清
+                        quality_engine.min_quality = 90;
+                        quality_engine.max_quality = 100;
+                    }
+                    _ => { // 50=均衡（默认）
+                        quality_engine.min_quality = 75;
+                        quality_engine.max_quality = 85;
+                    }
+                }
+                quality_engine.quality = quality_engine.quality.clamp(
+                    quality_engine.min_quality, quality_engine.max_quality);
 
                 compressor.set_quality(quality_engine.quality);
                 compressor.set_subsamp(if is_video { turbojpeg::Subsamp::Sub2x2 } else { turbojpeg::Subsamp::None });
@@ -1522,10 +1678,10 @@ async fn main() {
             }
 
             let elapsed_ms = frame_start.elapsed().as_millis() as u64;
-            let target_ms = 1000 / quality_engine.framerate;
-            if elapsed_ms < target_ms {
-                // 因为在独立线程中，这里用标准的 std::thread::sleep 即可
-                std::thread::sleep(std::time::Duration::from_millis(target_ms - elapsed_ms));
+            // 固定 33ms 帧间隔（约 30fps），替代动态 framerate 调节
+            // 静态画面通过 xxhash64 跳过，动态画面保证稳定帧率
+            if elapsed_ms < 33 {
+                std::thread::sleep(std::time::Duration::from_millis(33 - elapsed_ms));
             }
         }
     });

@@ -828,6 +828,20 @@ export default function App() {
               }}
             />
 
+            {/* Keyboard Capture Hint Overlay */}
+            {status === "connected" && !keyboardCaptured && (
+              <div 
+                className="absolute inset-0 z-30 flex items-center justify-center bg-slate-950/70 backdrop-blur-sm cursor-pointer select-none"
+                onClick={() => clientRef.current?.captureKeyboard()}
+              >
+                <div className="flex flex-col items-center gap-3 px-8 py-6 rounded-xl bg-slate-900/80 border border-slate-700/50 shadow-2xl">
+                  <span className="text-4xl">🖱️</span>
+                  <span className="text-white text-base font-bold tracking-wide">点击此处激活键盘控制</span>
+                  <span className="text-slate-400 text-xs">点击画布任意位置即可开始操作远程设备</span>
+                </div>
+              </div>
+            )}
+
             {/* Canvas Drag and Drop Overlay */}
             {isCanvasDragging && (
               <div className="absolute inset-0 z-50 bg-blue-950/80 backdrop-blur-md border-4 border-dashed border-blue-400 flex flex-col items-center justify-center text-white gap-3 animate-in fade-in duration-150">

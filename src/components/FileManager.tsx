@@ -440,6 +440,15 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
 
   const remotePathRef = useRef(remotePath);
   useEffect(() => { remotePathRef.current = remotePath; }, [remotePath]);
+
+  // 文件管理器打开时禁用远程控制输入，关闭时恢复
+  useEffect(() => {
+    if (isOpen) {
+      clientRef.current?.disableInput?.();
+    } else {
+      clientRef.current?.enableInput?.();
+    }
+  }, [isOpen, clientRef]);
   const loadTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const remoteEntriesRef = useRef<FileEntry[]>([]);
@@ -661,9 +670,7 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
       let displayName = file.name;
 
       if (relPath) {
-        const parts = relPath.replace(/\\/g, '/').split('/');
-        parts.pop();
-        const subDir = parts.join('\\');
+        const subDir = relPath.replace(/\\/g, '\\');
         if (subDir) {
           fileTargetDir = targetPath ? `${targetPath}\\${subDir}` : subDir;
           directories.add(fileTargetDir);

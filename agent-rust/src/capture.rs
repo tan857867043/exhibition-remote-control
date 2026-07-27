@@ -36,7 +36,8 @@ impl ScreenCapturer {
                 if error.kind() == std::io::ErrorKind::WouldBlock {
                     None
                 } else {
-                    panic!("抓取屏幕错误: {}", error);
+                    eprintln!("[Capture] 抓取屏幕错误 (跳过本帧): {}", error);
+                    None
                 }
             }
         }

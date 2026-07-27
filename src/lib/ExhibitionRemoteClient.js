@@ -73,8 +73,6 @@ class ExhibitionRemoteClient {
         this.lastMouseMoveTime = 0;
         this.keyboardCaptured = false;
         this.pressedKeys = {};
-        this.keyBatch = [];
-        this.keyBatchTimer = null;
         this.currentCursorType = 0;
         this._useImageDecoder = typeof ImageDecoder !== 'undefined';
         this._processingVideo = false;
@@ -83,6 +81,7 @@ class ExhibitionRemoteClient {
         this._wheelAccum = 0;
         this._receivedFrames = 0;
         this._renderedFrames = 0;
+        this._inputDisabled = false; // 文件管理器等弹窗打开时禁用远程输入，防止穿透
 
         // File transfer state
         this._fmCallback = null;
@@ -320,6 +319,7 @@ class ExhibitionRemoteClient {
     }
 
     handleMouseDown(e) {
+        if (this._inputDisabled) return;
         if (!this.isInsideCanvas(e)) return;
         this.isMouseDown = true;
         this.activeButton = e.button;
@@ -328,6 +328,7 @@ class ExhibitionRemoteClient {
     }
 
     handleMouseUp(e) {
+        if (this._inputDisabled) { this.isMouseDown = false; return; }
         if (this.isMouseDown) {
             this.isMouseDown = false;
             this.sendMouseEvent(e);
@@ -337,6 +338,7 @@ class ExhibitionRemoteClient {
 
     sendMouseEvent(e) {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+        if (this._inputDisabled) return;
         if (!this.keyboardCaptured && e.type !== 'mousedown' && !this.isMouseDown) return;
 
         const { x, y, isWithin } = this.getCanvasCoordinates(e);
@@ -379,6 +381,7 @@ class ExhibitionRemoteClient {
 
     sendKeyboardEvent(e) {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+        if (this._inputDisabled) return;
         const vk = getVk(e);
         if (!vk) return;
 
@@ -401,28 +404,9 @@ class ExhibitionRemoteClient {
             return;
         }
 
-        if (MODIFIER_CODES.has(e.code)) {
-            const action = e.type === 'keydown' ? 0 : 1;
-            const buf = new Uint8Array([0x04, 1, action, vk & 0xFF, (vk >> 8) & 0xFF, 0, 0]);
-            this.ws.send(buf.buffer);
-            return;
-        }
-
-        const action = e.type === 'keydown' ? 0 : 1;
-        this.keyBatch.push(action, vk & 0xFF, (vk >> 8) & 0xFF);
-        
-        if (!this.keyBatchTimer) {
-            this.keyBatchTimer = setTimeout(() => {
-                this.keyBatchTimer = null;
-                if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-                const buf = new Uint8Array(2 + this.keyBatch.length);
-                buf[0] = 0x04;
-                buf[1] = this.keyBatch.length / 3;
-                for (let i = 0; i < this.keyBatch.length; i++) buf[2 + i] = this.keyBatch[i];
-                this.ws.send(buf.buffer);
-                this.keyBatch = [];
-            }, 2);
-        }
+        // Send each key event immediately (no batching)
+        const keyAction = e.type === 'keydown' ? 0 : 1;
+        this.ws.send(JSON.stringify({ action: 'key', vk: vk, down: keyAction === 0 }));
     }
 
     setQuality(qualityValue) {
@@ -731,6 +715,17 @@ class ExhibitionRemoteClient {
             this.pressedKeys = {};
             this.onStats({ type: 'keyboard', captured: false });
         }
+    }
+
+    disableInput() {
+        this._inputDisabled = true;
+        if (this.keyboardCaptured) {
+            this.releaseKeyboard();
+        }
+    }
+
+    enableInput() {
+        this._inputDisabled = false;
     }
 
     destroy() {

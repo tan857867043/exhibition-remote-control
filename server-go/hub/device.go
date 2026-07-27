@@ -17,17 +17,19 @@ type DeviceInfo struct {
 
 // 核心状态数据结构：维护设备通道与订阅者的广播池
 type DeviceHub struct {
-	mu          sync.RWMutex
-	Agents      map[string]*websocket.Conn          // 存放 Rust 被控端的 WS 连接
-	DeviceInfos map[string]DeviceInfo               // 存放设备信息
-	LatestFrame map[string][]byte                   // 存放最新一帧完整的画面作为缩略图
-	Subscribers map[string]map[*websocket.Conn]bool // 存放订阅特定设备画面流的第三方应用连接
+	mu                 sync.RWMutex
+	Agents             map[string]*websocket.Conn          // 存放 Rust 被控端的 WS 连接
+	DeviceInfos        map[string]DeviceInfo               // 存放设备信息
+	LatestFrame        map[string][]byte                   // 存放最新一帧完整的画面作为缩略图
+	Subscribers        map[string]map[*websocket.Conn]bool // 存放订阅特定设备画面流的第三方应用连接
+	SubscriberChannels map[string]map[*websocket.Conn]chan []byte // 订阅者缓冲通道，帧满时 drain 旧帧
 }
 
 var GlobalHub = &DeviceHub{
-	Agents:      make(map[string]*websocket.Conn),
-	DeviceInfos: make(map[string]DeviceInfo),
-	LatestFrame: make(map[string][]byte),
-	Subscribers: make(map[string]map[*websocket.Conn]bool),
+	Agents:             make(map[string]*websocket.Conn),
+	DeviceInfos:        make(map[string]DeviceInfo),
+	LatestFrame:        make(map[string][]byte),
+	Subscribers:        make(map[string]map[*websocket.Conn]bool),
+	SubscriberChannels: make(map[string]map[*websocket.Conn]chan []byte),
 }
 
