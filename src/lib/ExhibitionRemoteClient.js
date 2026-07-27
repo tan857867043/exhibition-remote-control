@@ -525,7 +525,7 @@ class ExhibitionRemoteClient {
             throw new Error('WebSocket not connected');
         }
 
-        const CHUNK_SIZE = 16 * 1024;
+        const CHUNK_SIZE = 512 * 1024; // 512KB per chunk for faster transfer
         const uploadId = 'ul_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
 
         const state = {
@@ -584,6 +584,12 @@ class ExhibitionRemoteClient {
                 const combined = new Uint8Array(1 + chunkData.byteLength);
                 combined.set(header);
                 combined.set(new Uint8Array(chunkData), 1);
+                
+                // Wait if the buffer is full (e.g., > 10MB) to apply backpressure
+                while (this.ws.bufferedAmount > 10 * 1024 * 1024) {
+                    await new Promise(r => setTimeout(r, 10));
+                }
+                
                 this.ws.send(combined.buffer);
 
                 state.sentSize += chunkData.byteLength;
@@ -631,7 +637,7 @@ class ExhibitionRemoteClient {
             totalSize: 0,
             receivedSize: 0,
             chunks: [],
-            windowSize: 4,
+            windowSize: 64, // Increased window size for faster downloads
             onProgress: onProgress,
             readyResolve: null,
             doneResolve: null,
