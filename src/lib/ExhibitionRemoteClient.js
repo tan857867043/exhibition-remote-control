@@ -32,6 +32,21 @@ const CODE_TO_VK = {
 };
 const MODIFIER_CODES = new Set(['ShiftLeft','ShiftRight','ControlLeft','ControlRight','AltLeft','AltRight','MetaLeft','MetaRight']);
 
+// Cursor Type Map for Native Operating System Cursor Matching
+const CURSOR_STYLE_MAP = {
+    0: 'default',        // Arrow
+    1: 'text',           // I-beam
+    2: 'pointer',        // Hand
+    3: 'ns-resize',      // Size NS
+    4: 'ew-resize',      // Size WE
+    5: 'wait',           // Wait / App Starting
+    6: 'crosshair',      // Cross
+    7: 'move',           // Size All / Move
+    8: 'nesw-resize',    // Size NESW
+    9: 'se-resize',      // Size NWSE / SE
+    255: 'none'          // Hidden / Blank
+};
+
 function getVk(e){
     if(CODE_TO_VK[e.code]!==undefined)return CODE_TO_VK[e.code];
     return e.keyCode||e.which||0;
@@ -41,43 +56,49 @@ class ExhibitionRemoteClient {
     constructor(canvas, serverUrl, deviceId, onStats) {
         this.canvas = canvas;
         this.ctx = canvas.getContext('2d', { alpha: false });
+        this.ctx.imageSmoothingEnabled = false;
         this.serverUrl = serverUrl;
         this.deviceId = deviceId;
         this.onStats = onStats;
 
         this.offscreenCanvas = document.createElement('canvas');
         this.offscreenCtx = this.offscreenCanvas.getContext('2d', { alpha: false });
+        this.offscreenCtx.imageSmoothingEnabled = false;
 
-        this.maxFullW = this.canvas.width;
-        this.maxFullH = this.canvas.height;
+        this.maxFullW = this.canvas.width || 1920;
+        this.maxFullH = this.canvas.height || 1080;
 
-        this.mouseDown = false;
+        this.isMouseDown = false;
+        this.activeButton = -1;
         this.lastMouseMoveTime = 0;
         this.keyboardCaptured = false;
         this.pressedKeys = {};
         this.keyBatch = [];
         this.keyBatchTimer = null;
+        this.currentCursorType = 0;
+        this._useImageDecoder = typeof ImageDecoder !== 'undefined';
+        this._processingVideo = false;
+        this._frameSeq = 0;
+        this._rAFId = null;
+        this._wheelAccum = 0;
 
-        this.cursorX = -1;
-        this.cursorY = -1;
-        this.cursorType = 0;
-        this.pendingRender = null;
-        this.rAFId = null;
-        this.frameSeq = 0;        // 帧序号，防止 async 竞态
-        this.receivedFrames = 0;  // 收到的帧计数
-        this.renderedFrames = 0;  // 实际渲染的帧计数（用于真实 FPS）
-        this._processingVideo = false; // 视频帧处理中锁，防止并发解码浪费
+        // File transfer state
+        this._fmCallback = null;
 
-        this.canvas.style.cursor = 'none';
+        this._downloadState = null;
+        this._uploadState = null;
 
+        // Window-level handlers to preserve drag state outside canvas bounds
         this._onMouseMove = (e) => this.sendMouseEvent(e);
-        this._onMouseDown = (e) => this.sendMouseEvent(e);
-        this._onMouseUp = (e) => this.sendMouseEvent(e);
+        this._onMouseDown = (e) => this.handleMouseDown(e);
+        this._onMouseUp = (e) => this.handleMouseUp(e);
         this._onWheel = (e) => this.sendMouseEvent(e);
         this._onKeyDown = (e) => this.sendKeyboardEvent(e);
         this._onKeyUp = (e) => this.sendKeyboardEvent(e);
         this._onContextMenu = (e) => {
-            if (this.keyboardCaptured) e.preventDefault();
+            if (this.keyboardCaptured || this.isInsideCanvas(e)) {
+                e.preventDefault();
+            }
         };
 
         this.initConnection();
@@ -94,175 +115,234 @@ class ExhibitionRemoteClient {
 
         this.ws.onopen = () => {
             console.log("Connected to device stream");
-            // Set default quality immediately
             this.setQuality(50);
         };
 
         this.ws.onmessage = async (e) => {
-            if (typeof e.data === 'string') return;
-            const buf = new Uint8Array(e.data);
-            this.onStats({ type: 'frame', byteLength: buf.length });
-            this.receivedFrames++;
-            const totalSize = buf.length;
-            if (totalSize < 1) return;
-
-            const frameType = buf[0];
-
-            if (frameType === 0x07) {
-                // === 光标位置 ===
-                // [0x07][cursor_x:2 BE][cursor_y:2 BE]
-                if (totalSize < 5) return;
-                this.cursorX = (buf[1] << 8) | buf[2];
-                this.cursorY = (buf[3] << 8) | buf[4];
-            } else if (frameType === 0x08) {
-                // === 光标形状 ===
-                // [0x08][cursor_type:1][png_len:2 BE][png_data...]
-                if (totalSize < 4) return;
-                this.cursorType = buf[1];
-            } else if (this._processingVideo) {
-                // 视频帧(0x01~0x04)处理中锁：上一帧解码尚未完成，直接丢弃当前帧
-                // 避免多个 async handler 并发导致 Go server 通道积压 + 50% 丢弃
+            if (typeof e.data === 'string') {
+                try {
+                    const msg = JSON.parse(e.data);
+                    console.log("[WS] Received text message:", msg.action, msg);
+                    if (msg.action && (msg.action === 'download' || msg.action === 'upload')) {
+                        this._handleFileMessage(msg);
+                    } else if (this._fmCallback) {
+                        console.log("[WS] Routing to _fmCallback:", msg.action);
+                        this._fmCallback(msg);
+                    }
+                } catch(err) {
+                    console.error("[WS] Failed to parse text message:", err, e.data);
+                }
                 return;
-            } else if (frameType === 0x01) {
-                // === 批量增量块消息 (v2) ===
-                this._processingVideo = true;
-                try {
-                this.onStats({ type: 'frame', frameType: 0x01, byteLength: 0 });
-                if (totalSize < 3) return;
-                const numBlocks = (buf[1] << 8) | buf[2];
-                if (numBlocks === 0) return;
+            }
+            const buf = new Uint8Array(e.data);
 
-                // 逐块解析 + 渲染到离屏 canvas
-                let offset = 3;
-                const BLOCK_HEADER = 11;
-                const jpegBatch = [];
+            if (buf.length >= 4 && buf[0] === 0x01 && buf[1] === 0x00 && buf[2] === 0x00 && this._downloadState) {
+                const state = this._downloadState;
 
-                for (let i = 0; i < numBlocks && offset + BLOCK_HEADER <= totalSize; i++) {
-                    const bx = (buf[offset] << 8) | buf[offset+1];
-                    const by = (buf[offset+2] << 8) | buf[offset+3];
-                    const bw = (buf[offset+4] << 8) | buf[offset+5];
-                    const bh = (buf[offset+6] << 8) | buf[offset+7];
-                    const encoding = buf[offset+8];
-                    const dataLen = (buf[offset+9] << 8) | buf[offset+10];
-                    offset += BLOCK_HEADER;
-                    if (dataLen === 0 || offset + dataLen > totalSize) break;
-
-                    if (encoding === 1) {
-                        const rawData = new Uint8Array(buf.slice(offset, offset + dataLen));
-                        const clampedArray = new Uint8ClampedArray(rawData.buffer, rawData.byteOffset, dataLen);
-                        const imageData = new ImageData(clampedArray, bw, bh);
-                        this.offscreenCtx.putImageData(imageData, bx, by);
-                    } else {
-                        jpegBatch.push({ x: bx, y: by, w: bw, h: bh, data: buf.slice(offset, offset + dataLen) });
-                    }
-                    offset += dataLen;
+                if (state.cancelled) {
+                    return;
                 }
 
-                // JPEG 块分批解码（每批 4 个并发）
-                const batchMySeq = ++this.frameSeq;
-                const BATCH_SIZE = 4;
-                for (let i = 0; i < jpegBatch.length; i += BATCH_SIZE) {
-                    const batch = jpegBatch.slice(i, i + BATCH_SIZE);
-                    const results = await Promise.all(batch.map(async (b) => {
-                        const bitmap = await createImageBitmap(new Blob([b.data]));
-                        return { bitmap, x: b.x, y: b.y, w: b.w, h: b.h };
+                const isLast = buf[3] === 0x01;
+                const chunkData = buf.slice(4);
+                
+                state.chunks.push(chunkData);
+                state.receivedSize += chunkData.length;
+                
+                if (state.onProgress && state.totalSize > 0) {
+                    const progress = Math.min(100, Math.round((state.receivedSize / state.totalSize) * 100));
+                    const elapsed = state.startTime > 0 ? (performance.now() - state.startTime) / 1000 : 0;
+                    const speedMBs = elapsed > 0 ? (state.receivedSize / 1024 / 1024) / elapsed : 0;
+                    state.onProgress(progress, speedMBs, 'transferring');
+                }
+                
+                if (!isLast && !state.paused) {
+                    this.ws.send(JSON.stringify({
+                        action: 'download',
+                        sub: 'ack',
+                        id: state.id,
                     }));
-                    if (batchMySeq !== this.frameSeq) {
-                        for (const {bitmap} of results) bitmap.close();
-                        break;
+                }
+                
+                if (isLast) {
+                    const combined = new Uint8Array(state.receivedSize);
+                    let offset = 0;
+                    for (let i = 0; i < state.chunks.length; i++) {
+                        combined.set(state.chunks[i], offset);
+                        offset += state.chunks[i].length;
                     }
-                    for (const {bitmap, x, y, w, h} of results) {
-                        this.offscreenCtx.drawImage(bitmap, x, y, w, h);
-                        bitmap.close();
+                    if (state.doneResolve) {
+                        state.doneResolve(combined.buffer);
                     }
                 }
-                if (batchMySeq === this.frameSeq) {
-                    this.renderedFrames++;
-                }
-                } finally {
-                    this._processingVideo = false;
-                }
-                // 通过 rAF 渲染队列拷贝到显示 canvas
-                this.pendingRender = true;
-                if (this.rAFId === null) {
-                    this.rAFId = requestAnimationFrame(() => this._renderLoop());
-                }
-            } else {
-                // === 全帧消息 ===
-                this._processingVideo = true;
-                try {
-                const HEADER_SIZE = 9;
-                if (totalSize < HEADER_SIZE) return;
-                const x = (buf[1] << 8) | buf[2];
-                const y = (buf[3] << 8) | buf[4];
-                const w = (buf[5] << 8) | buf[6];
-                const h = (buf[7] << 8) | buf[8];
-                if (w === 0 || h === 0) return;
-                const jpegData = buf.slice(HEADER_SIZE);
-                if (jpegData.length === 0) return;
+                return;
+            }
 
-                if (w !== this.offscreenCanvas.width || h !== this.offscreenCanvas.height) {
-                    this.offscreenCanvas.width = w;
-                    this.offscreenCanvas.height = h;
-                    this.canvas.width = w;
-                    this.canvas.height = h;
-                    this.maxFullW = w;
-                    this.maxFullH = h;
-                }
+            this.onStats({ type: 'frame', byteLength: buf.length });
 
-                try {
-                    const mySeq = ++this.frameSeq;
-                    const bitmap = await createImageBitmap(new Blob([jpegData]));
-                    if (mySeq !== this.frameSeq) { bitmap.close(); return; } // 过期帧，丢弃
-                    this.offscreenCtx.drawImage(bitmap, 0, 0, w, h);
+            if (this._processingVideo) return;
+            this._processingVideo = true;
+            try {
+                const MIN_HEADER_SIZE = 14;
+                let offset = 0;
+                const totalSize = buf.length;
+                const mySeq = ++this._frameSeq;
+                let cursorType = this.currentCursorType;
+
+                while (offset + MIN_HEADER_SIZE <= totalSize) {
+                    const frameType = buf[offset];
+                    const x = (buf[offset + 1] << 8) | buf[offset + 2];
+                    const y = (buf[offset + 3] << 8) | buf[offset + 4];
+                    const w = (buf[offset + 5] << 8) | buf[offset + 6];
+                    const h = (buf[offset + 7] << 8) | buf[offset + 8];
+                    const jpegLen = (buf[offset + 9] << 24) | (buf[offset + 10] << 16) | (buf[offset + 11] << 8) | buf[offset + 12];
+                    cursorType = buf[offset + 13];
+
+                    if (frameType === 0x01) {
+                        this.onStats({ type: 'frame', frameType: 0x01, byteLength: 0 });
+                    }
+
+                    const regionSize = MIN_HEADER_SIZE + jpegLen;
+                    if (offset + regionSize > totalSize) break;
+
+                    if (w === 0 || h === 0 || jpegLen === 0) {
+                        offset += regionSize;
+                        continue;
+                    }
+
+                    const jpegData = buf.slice(offset + MIN_HEADER_SIZE, offset + regionSize);
+
+                    if (frameType === 0x02 || frameType === 0x03 || frameType === 0x04) {
+                        if (w !== this.offscreenCanvas.width || h !== this.offscreenCanvas.height) {
+                            this.offscreenCanvas.width = w;
+                            this.offscreenCanvas.height = h;
+                            this.offscreenCtx.imageSmoothingEnabled = false;
+                            this.canvas.width = w;
+                            this.canvas.height = h;
+                            this.ctx.imageSmoothingEnabled = false;
+                            this.maxFullW = w;
+                            this.maxFullH = h;
+                        }
+                    }
+
+                    const bitmap = await this._decodeJpeg(jpegData);
+                    if (mySeq !== this._frameSeq) { bitmap.close(); return; }
+                    this.offscreenCtx.drawImage(bitmap, x, y, w, h);
                     bitmap.close();
-                    this.renderedFrames++;
-                    // 通过 rAF 渲染队列拷贝到显示 canvas
-                    this.pendingRender = true;
-                    if (this.rAFId === null) {
-                        this.rAFId = requestAnimationFrame(() => this._renderLoop());
+                    offset += regionSize;
+                }
+
+                if (mySeq === this._frameSeq) {
+                    this._scheduleRender();
+                    if (this.currentCursorType !== cursorType) {
+                        this.currentCursorType = cursorType;
+                        this.updateCursorStyle();
                     }
-                } catch (err) {
-                    console.error("Decode error:", err);
                 }
-                } finally {
-                    this._processingVideo = false;
-                }
+            } finally {
+                this._processingVideo = false;
             }
         };
 
         this.ws.onclose = () => {
             console.log("Disconnected from device stream");
+            if (this._downloadState && this._downloadState.errorReject) {
+                this._downloadState.errorReject(new Error('disconnected'));
+            }
+            if (this._uploadState && this._uploadState.errorReject) {
+                this._uploadState.errorReject(new Error('disconnected'));
+            }
+            this._downloadState = null;
+            this._uploadState = null;
         };
     }
 
-    sendMouseEvent(e) {
-        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-        if (!this.keyboardCaptured && e.type !== 'mousedown') return;
-
-        if (e.type === 'mousedown') {
-            this.captureKeyboard();
+    _scheduleRender() {
+        if (this._rAFId === null) {
+            this._rAFId = requestAnimationFrame(() => {
+                this._rAFId = null;
+                this.ctx.drawImage(this.offscreenCanvas, 0, 0);
+            });
         }
+    }
 
+    async _decodeJpeg(jpegData) {
+        if (this._useImageDecoder) {
+            try {
+                const decoder = new ImageDecoder({ data: jpegData, type: 'image/jpeg' });
+                const result = await decoder.decode();
+                return result.image;
+            } catch (e) {
+                this._useImageDecoder = false;
+            }
+        }
+        return await createImageBitmap(new Blob([jpegData]));
+    }
+
+    updateCursorStyle() {
+        if (!this.canvas) return;
+        const style = CURSOR_STYLE_MAP[this.currentCursorType] || 'default';
+        this.canvas.style.cursor = style;
+    }
+
+    isInsideCanvas(e) {
+        if (!this.canvas) return false;
+        const r = this.canvas.getBoundingClientRect();
+        return e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom;
+    }
+
+    getCanvasCoordinates(e) {
         const r = this.canvas.getBoundingClientRect();
         const scale = Math.min(r.width / this.canvas.width, r.height / this.canvas.height);
         const imgW = this.canvas.width * scale;
         const imgH = this.canvas.height * scale;
         const offsetX = (r.width - imgW) / 2;
         const offsetY = (r.height - imgH) / 2;
-        const rx = e.clientX - r.left - offsetX;
-        const ry = e.clientY - r.top - offsetY;
         
-        if (rx < 0 || ry < 0 || rx > imgW || ry > imgH) return;
+        let rx = e.clientX - r.left - offsetX;
+        let ry = e.clientY - r.top - offsetY;
+
+        // Clamp values to canvas dimensions during drag operations
+        rx = Math.max(0, Math.min(imgW, rx));
+        ry = Math.max(0, Math.min(imgH, ry));
         
         const x = Math.round(rx / scale);
         const y = Math.round(ry / scale);
-        const btn = e.button; 
-        
+        return { x, y, isWithin: rx >= 0 && ry >= 0 && rx <= imgW && ry <= imgH };
+    }
+
+    handleMouseDown(e) {
+        if (!this.isInsideCanvas(e)) return;
+        this.isMouseDown = true;
+        this.activeButton = e.button;
+        this.captureKeyboard();
+        this.sendMouseEvent(e);
+    }
+
+    handleMouseUp(e) {
+        if (this.isMouseDown) {
+            this.isMouseDown = false;
+            this.sendMouseEvent(e);
+            this.activeButton = -1;
+        }
+    }
+
+    sendMouseEvent(e) {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+        if (!this.keyboardCaptured && e.type !== 'mousedown' && !this.isMouseDown) return;
+
+        const { x, y, isWithin } = this.getCanvasCoordinates(e);
+        if (!isWithin && e.type !== 'mouseup' && e.type !== 'mousemove') return;
+
+        // Web button → Agent mapping: Web(0=Left,1=Middle,2=Right) → Agent(0=Left,1=Right,2=Middle)
+        const BTN_MAP = [0, 2, 1];
+        const btn = BTN_MAP[e.button] ?? e.button;
         let buf;
+
         if (e.type === 'mousemove') {
-            const now = Date.now();
-            if (now - this.lastMouseMoveTime < 16) return;
+            const now = performance.now();
+            // Ultra-responsive mouse movement (~120Hz throughput limit for zero lag)
+            if (now - this.lastMouseMoveTime < 8) return;
             this.lastMouseMoveTime = now;
             buf = new Uint8Array([0x01, btn, x & 0xFF, (x >> 8) & 0xFF, y & 0xFF, (y >> 8) & 0xFF]);
         } else if (e.type === 'mousedown') {
@@ -271,8 +351,17 @@ class ExhibitionRemoteClient {
             buf = new Uint8Array([0x02, btn, 0, 0, 0, 0]);
         } else if (e.type === 'wheel') {
             e.preventDefault();
-            const d = Math.round(e.deltaY);
-            buf = new Uint8Array([0x03, 0, d & 0xFF, (d >> 8) & 0xFF, 0, 0]);
+            // Accumulate deltas and send notch count when reaching WHEEL_DELTA threshold
+            // Works with all mice: Chrome(~100/notch), Firefox(~3), smooth-scroll(~4-16)
+            this._wheelAccum += e.deltaY;
+            const clicks = Math.trunc(this._wheelAccum / 120);
+            if (clicks !== 0) {
+                this._wheelAccum -= clicks * 120;
+                const d = clicks;
+                buf = new Uint8Array([0x03, 0, d & 0xFF, (d >> 8) & 0xFF, 0, 0]);
+            } else {
+                return;
+            }
         } else {
             return;
         }
@@ -334,25 +423,278 @@ class ExhibitionRemoteClient {
         }
     }
 
-    getRenderedFrameCount() {
-        return this.renderedFrames;
+    _handleFileMessage(msg) {
+        switch(msg.action) {
+            case 'file_error':
+                if (this._downloadState && this._downloadState.errorReject) {
+                    this._downloadState.errorReject(new Error(msg.error || 'download_error'));
+                }
+                if (this._uploadState && this._uploadState.errorReject) {
+                    this._uploadState.errorReject(new Error(msg.error || 'upload_error'));
+                }
+                break;
+            case 'download':
+                if (msg.sub === 'start') {
+                    if (this._downloadState) {
+                        this._downloadState.totalSize = msg.size || 0;
+                        if (this._downloadState.readyResolve) {
+                            this._downloadState.readyResolve();
+                        }
+                    }
+                }
+                break;
+            case 'upload':
+                if (msg.sub === 'start' && this._uploadState) {
+                    if (this._uploadState.readyResolve) {
+                        this._uploadState.readyResolve();
+                    }
+                } else if (msg.sub === 'done' && this._uploadState) {
+                    if (this._uploadState.doneResolve) {
+                        this._uploadState.doneResolve();
+                    }
+                } else if (msg.sub === 'error' && this._uploadState) {
+                    if (this._uploadState.errorReject) {
+                        this._uploadState.errorReject(new Error(msg.error || 'upload_error'));
+                    }
+                }
+                break;
+        }
     }
-    getReceivedFrameCount() {
-        return this.receivedFrames;
+
+    setFileManagerCallback(cb) {
+        this._fmCallback = cb;
     }
-    resetFrameCount() {
-        this.renderedFrames = 0;
-        this.receivedFrames = 0;
+
+    pauseTransfer() {
+        if (this._uploadState) {
+            this._uploadState.paused = true;
+        }
+        if (this._downloadState) {
+            this._downloadState.paused = true;
+        }
+    }
+
+    resumeTransfer() {
+        if (this._uploadState) {
+            this._uploadState.paused = false;
+            if (this._uploadState.pauseResolve) {
+                const resolve = this._uploadState.pauseResolve;
+                this._uploadState.pauseResolve = null;
+                resolve();
+            }
+        }
+        if (this._downloadState) {
+            this._downloadState.paused = false;
+            if (this._downloadState.pauseResolve) {
+                const resolve = this._downloadState.pauseResolve;
+                this._downloadState.pauseResolve = null;
+                resolve();
+            }
+        }
+    }
+
+    cancelTransfer() {
+        if (this._uploadState) {
+            this._uploadState.cancelled = true;
+            this._uploadState.paused = false;
+            if (this._uploadState.pauseResolve) {
+                const resolve = this._uploadState.pauseResolve;
+                this._uploadState.pauseResolve = null;
+                resolve();
+            }
+            if (this._uploadState.errorReject) {
+                this._uploadState.errorReject(new Error('cancelled'));
+            }
+        }
+        if (this._downloadState) {
+            this._downloadState.cancelled = true;
+            this._downloadState.paused = false;
+            if (this._downloadState.pauseResolve) {
+                const resolve = this._downloadState.pauseResolve;
+                this._downloadState.pauseResolve = null;
+                resolve();
+            }
+            if (this._downloadState.errorReject) {
+                this._downloadState.errorReject(new Error('cancelled'));
+            }
+        }
+    }
+
+    async sendFile(file, targetDir, options, onProgress) {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+            throw new Error('WebSocket not connected');
+        }
+
+        const CHUNK_SIZE = 16 * 1024;
+        const uploadId = 'ul_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+
+        const state = {
+            id: uploadId,
+            file: file,
+            totalSize: file.size,
+            sentSize: 0,
+            readyResolve: null,
+            doneResolve: null,
+            errorReject: null,
+            onProgress: onProgress,
+            paused: false,
+            cancelled: false,
+            pauseResolve: null,
+        };
+        this._uploadState = state;
+
+        try {
+            await new Promise((resolve, reject) => {
+                state.readyResolve = resolve;
+                state.errorReject = reject;
+                const timeout = setTimeout(() => reject(new Error('upload start timeout')), 30000);
+                state.errorReject = (err) => {
+                    clearTimeout(timeout);
+                    reject(err);
+                };
+                this.ws.send(JSON.stringify({
+                    action: 'upload',
+                    sub: 'start',
+                    path: targetDir,
+                    name: file.name,
+                    size: file.size,
+                    id: uploadId,
+                }));
+            });
+
+            const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+            const startTime = performance.now();
+
+            for (let i = 0; i < totalChunks; i++) {
+                if (state.cancelled) {
+                    throw new Error('cancelled');
+                }
+                while (state.paused) {
+                    await new Promise((resolve) => { state.pauseResolve = resolve; });
+                }
+                if (state.cancelled) {
+                    throw new Error('cancelled');
+                }
+
+                const begin = i * CHUNK_SIZE;
+                const end = Math.min(begin + CHUNK_SIZE, file.size);
+                const chunkData = await file.slice(begin, end).arrayBuffer();
+
+                const header = new Uint8Array([0x09]);
+                const combined = new Uint8Array(1 + chunkData.byteLength);
+                combined.set(header);
+                combined.set(new Uint8Array(chunkData), 1);
+                this.ws.send(combined.buffer);
+
+                state.sentSize += chunkData.byteLength;
+
+                if (onProgress && (i % 8 === 0 || i === totalChunks - 1)) {
+                    const progress = Math.round((state.sentSize / state.totalSize) * 100);
+                    const elapsed = (performance.now() - startTime) / 1000;
+                    const speedMBs = elapsed > 0 ? (state.sentSize / 1024 / 1024) / elapsed : 0;
+                    onProgress(progress, speedMBs, 'transferring');
+                }
+            }
+
+            while (this.ws.bufferedAmount > 0) {
+                await new Promise(r => setTimeout(r, 5));
+            }
+
+            this.ws.send(JSON.stringify({
+                action: 'upload',
+                sub: 'done',
+                id: uploadId,
+            }));
+
+            await new Promise((resolve, reject) => {
+                state.doneResolve = resolve;
+                state.errorReject = reject;
+                setTimeout(() => reject(new Error('upload done timeout')), 60000);
+            });
+
+            if (onProgress) onProgress(100, 0, 'completed');
+        } finally {
+            this._uploadState = null;
+        }
+    }
+
+    async downloadFile(remotePath, onProgress) {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+            throw new Error('WebSocket not connected');
+        }
+
+        const downloadId = 'dl_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+        const fileName = remotePath.split('\\').pop() || remotePath.split('/').pop() || 'download';
+        
+        const state = {
+            id: downloadId,
+            totalSize: 0,
+            receivedSize: 0,
+            chunks: [],
+            windowSize: 4,
+            onProgress: onProgress,
+            readyResolve: null,
+            doneResolve: null,
+            errorReject: null,
+            cancelled: false,
+            paused: false,
+            pauseResolve: null,
+            startTime: 0,
+        };
+        this._downloadState = state;
+
+        try {
+            await new Promise((resolve, reject) => {
+                state.readyResolve = resolve;
+                state.errorReject = reject;
+                const timeout = setTimeout(() => reject(new Error('download start timeout')), 30000);
+                state.errorReject = (err) => {
+                    clearTimeout(timeout);
+                    reject(err);
+                };
+                this.ws.send(JSON.stringify({
+                    action: 'download',
+                    sub: 'start',
+                    path: remotePath,
+                    id: downloadId,
+                }));
+            });
+
+            this.ws.send(JSON.stringify({
+                action: 'download',
+                sub: 'startack',
+                id: downloadId,
+                ack: state.windowSize,
+            }));
+            state.startTime = performance.now();
+
+            const result = await new Promise((resolve, reject) => {
+                state.doneResolve = resolve;
+                state.errorReject = reject;
+                setTimeout(() => reject(new Error('download timeout')), 300000);
+            });
+
+            if (onProgress) onProgress(100, 0, 'completed');
+
+            const blob = new Blob([result]);
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = fileName;
+            a.click();
+            URL.revokeObjectURL(a.href);
+        } finally {
+            this._downloadState = null;
+        }
     }
 
     initInputBinding() {
-        document.addEventListener('mousemove', this._onMouseMove);
-        document.addEventListener('mousedown', this._onMouseDown);
-        document.addEventListener('mouseup', this._onMouseUp);
+        window.addEventListener('mousemove', this._onMouseMove, { passive: true });
+        window.addEventListener('mousedown', this._onMouseDown, { passive: true });
+        window.addEventListener('mouseup', this._onMouseUp, { passive: true });
         this.canvas.addEventListener('wheel', this._onWheel, { passive: false });
-        document.addEventListener('contextmenu', this._onContextMenu);
-        document.addEventListener('keydown', this._onKeyDown);
-        document.addEventListener('keyup', this._onKeyUp);
+        window.addEventListener('contextmenu', this._onContextMenu);
+        window.addEventListener('keydown', this._onKeyDown);
+        window.addEventListener('keyup', this._onKeyUp);
     }
 
     captureKeyboard() {
@@ -377,40 +719,25 @@ class ExhibitionRemoteClient {
         }
     }
 
-    _renderLoop() {
-        if (this.pendingRender) {
-            this.pendingRender = false;
-            this.ctx.drawImage(this.offscreenCanvas, 0, 0);
-            // 绘制光标叠加层
-            if (this.cursorX >= 0) {
-                this.ctx.beginPath();
-                this.ctx.arc(this.cursorX, this.cursorY, 4, 0, 2 * Math.PI);
-                this.ctx.fillStyle = 'rgba(255,255,255,0.8)';
-                this.ctx.fill();
-                this.ctx.strokeStyle = 'rgba(0,0,0,0.8)';
-                this.ctx.lineWidth = 1.5;
-                this.ctx.stroke();
-            }
-        }
-        this.rAFId = requestAnimationFrame(() => this._renderLoop());
-    }
-
     destroy() {
-        if (this.rAFId !== null) {
-            cancelAnimationFrame(this.rAFId);
-            this.rAFId = null;
+        if (this._rAFId !== null) {
+            cancelAnimationFrame(this._rAFId);
+            this._rAFId = null;
         }
         if (this.ws) {
             this.ws.close();
             this.ws = null;
         }
-        document.removeEventListener('mousemove', this._onMouseMove);
-        document.removeEventListener('mousedown', this._onMouseDown);
-        document.removeEventListener('mouseup', this._onMouseUp);
-        this.canvas.removeEventListener('wheel', this._onWheel);
-        document.removeEventListener('contextmenu', this._onContextMenu);
-        document.removeEventListener('keydown', this._onKeyDown);
-        document.removeEventListener('keyup', this._onKeyUp);
+        window.removeEventListener('mousemove', this._onMouseMove);
+        window.removeEventListener('mousedown', this._onMouseDown);
+        window.removeEventListener('mouseup', this._onMouseUp);
+        if (this.canvas) {
+            this.canvas.removeEventListener('wheel', this._onWheel);
+        }
+        window.removeEventListener('contextmenu', this._onContextMenu);
+        window.removeEventListener('keydown', this._onKeyDown);
+        window.removeEventListener('keyup', this._onKeyUp);
     }
 }
+
 export default ExhibitionRemoteClient;

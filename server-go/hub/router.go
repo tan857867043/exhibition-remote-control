@@ -1,11 +1,13 @@
 package hub
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"log"
 	"net"
 	"net/http"
-	"time"
+	"os"
+	"path/filepath"
 
 	"github.com/gorilla/websocket"
 )
@@ -36,6 +38,7 @@ func InitRouter() {
 	http.HandleFunc("/api/v1/devices/thumbnail", corsMiddleware(handleThumbnail))
 	http.HandleFunc("/api/v1/stream", handleStreamSubscribe)
 	http.HandleFunc("/api/v1/control", corsMiddleware(handleExternalControl))
+	http.HandleFunc("/agents", corsMiddleware(handleAgentDownload))
 }
 
 // 接收 Rust Agent 的画面数据并高效流式分发给所有第三方订阅者
@@ -44,9 +47,6 @@ func handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Println("Upgrade error:", err)
 		return
-	}
-	if tcp, ok := conn.UnderlyingConn().(*net.TCPConn); ok {
-		tcp.SetNoDelay(true)
 	}
 	deviceID := r.URL.Query().Get("device_id")
 	deviceName := r.URL.Query().Get("device_name")
@@ -59,12 +59,6 @@ func handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 		conn.Close()
 		return
 	}
-
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("Recovered from agent handler panic: %v", r)
-		}
-	}()
 
 	GlobalHub.mu.Lock()
 	GlobalHub.Agents[deviceID] = conn
@@ -95,28 +89,35 @@ func handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if messageType == websocket.BinaryMessage {
-			if len(payload) > 14 && (payload[0] == 0x02 || payload[0] == 0x04) { // 0x02 or 0x04 indicates full frame
+			if len(payload) > 14 && (payload[0] == 0x02 || payload[0] == 0x03 || payload[0] == 0x04) {
 				GlobalHub.mu.Lock()
-				// Extract JPEG bytes (skip 14 bytes header)
-				jpegBytes := make([]byte, len(payload)-14)
-				copy(jpegBytes, payload[14:])
-				GlobalHub.LatestFrame[deviceID] = jpegBytes
+				// 保存完整帧（含 14 字节头），供新订阅者连接时直接推送
+				frame := make([]byte, len(payload))
+				copy(frame, payload)
+				GlobalHub.LatestFrame[deviceID] = frame
 				GlobalHub.mu.Unlock()
 			}
 			GlobalHub.mu.RLock()
 			subs := GlobalHub.Subscribers[deviceID]
-			for _, sub := range subs {
-				// 非阻塞推送到通道；通道满时丢掉最旧帧让位给最新帧
-				select {
-				case sub.Ch <- payload:
-				default:
-					// 缓冲满：主动 drain 一条旧帧腾位置，确保最新帧不被丢弃
-					select {
-					case <-sub.Ch:
-					default:
-					}
-					sub.Ch <- payload
+			for subConn := range subs {
+				// 异步无阻塞流式转发原始二进制画面块
+				err := subConn.WriteMessage(websocket.BinaryMessage, payload)
+				if err != nil {
+					log.Println("Write error to sub:", err)
 				}
+			}
+			GlobalHub.mu.RUnlock()
+		} else if messageType == websocket.TextMessage {
+			displayLen := len(payload)
+			if displayLen > 200 {
+				displayLen = 200
+			}
+			log.Printf("[Hub] Agent %s sent text: %s", deviceID, string(payload[:displayLen]))
+			GlobalHub.mu.RLock()
+			subs := GlobalHub.Subscribers[deviceID]
+			log.Printf("[Hub] Forwarding text to %d subscribers", len(subs))
+			for subConn := range subs {
+				subConn.WriteMessage(websocket.TextMessage, payload)
 			}
 			GlobalHub.mu.RUnlock()
 		}
@@ -187,7 +188,7 @@ func handleThumbnail(w http.ResponseWriter, r *http.Request) {
 	frame, exists := GlobalHub.LatestFrame[deviceID]
 	GlobalHub.mu.RUnlock()
 
-	if !exists || len(frame) == 0 {
+	if !exists || len(frame) < 15 {
 		w.WriteHeader(http.StatusNotFound)
 		w.Write([]byte("Thumbnail not available yet"))
 		return
@@ -196,7 +197,8 @@ func handleThumbnail(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "image/jpeg")
 	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Write(frame)
+	// 跳过 14 字节头，输出纯 JPEG 数据
+	w.Write(frame[14:])
 }
 
 func handleStreamSubscribe(w http.ResponseWriter, r *http.Request) {
@@ -205,52 +207,56 @@ func handleStreamSubscribe(w http.ResponseWriter, r *http.Request) {
 		log.Println("Upgrade error:", err)
 		return
 	}
-	if tcp, ok := conn.UnderlyingConn().(*net.TCPConn); ok {
-		tcp.SetNoDelay(true)
-	}
 	deviceID := r.URL.Query().Get("device_id")
 
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("Recovered from subscriber handler panic: %v", r)
-		}
-	}()
-
-	// 创建订阅者：带缓冲通道 + 专用写 goroutine（避免 goroutine 爆炸和写锁竞争）
-	sub := &Subscriber{
-		Conn: conn,
-		Ch:   make(chan []byte, 16), // 16 帧缓冲，满则丢帧
-	}
-
 	GlobalHub.mu.Lock()
+	wasEmpty := len(GlobalHub.Subscribers[deviceID]) == 0
 	if GlobalHub.Subscribers[deviceID] == nil {
-		GlobalHub.Subscribers[deviceID] = make(map[*websocket.Conn]*Subscriber)
+		GlobalHub.Subscribers[deviceID] = make(map[*websocket.Conn]bool)
 	}
-	GlobalHub.Subscribers[deviceID][conn] = sub
+	GlobalHub.Subscribers[deviceID][conn] = true
 	GlobalHub.mu.Unlock()
 
-	// 专用写 goroutine：顺序读取通道消息并写入 WebSocket
-	go func() {
-		for data := range sub.Ch {
-			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			if err := conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
-				break
-			}
+	// 第一个订阅者连接时通知 Agent 恢复截图
+	if wasEmpty {
+		GlobalHub.mu.RLock()
+		agentConn, exists := GlobalHub.Agents[deviceID]
+		GlobalHub.mu.RUnlock()
+		if exists {
+			agentConn.WriteMessage(websocket.TextMessage, []byte(`{"action":"resume"}`))
 		}
-		// 通道关闭时退出
-	}()
+	}
+
+	// 订阅时立即推送最新缓存帧，确保被控端画面静止时控制窗口也能显示画面
+	GlobalHub.mu.RLock()
+	latestFrame := GlobalHub.LatestFrame[deviceID]
+	GlobalHub.mu.RUnlock()
+	if latestFrame != nil {
+		conn.WriteMessage(websocket.BinaryMessage, latestFrame)
+	}
 
 	defer func() {
-		close(sub.Ch)
+		var becameEmpty bool
 		GlobalHub.mu.Lock()
 		if GlobalHub.Subscribers[deviceID] != nil {
 			delete(GlobalHub.Subscribers[deviceID], conn)
 			if len(GlobalHub.Subscribers[deviceID]) == 0 {
 				delete(GlobalHub.Subscribers, deviceID)
+				becameEmpty = true
 			}
 		}
 		GlobalHub.mu.Unlock()
 		conn.Close()
+
+		// 最后一个订阅者离开时通知 Agent 暂停截图
+		if becameEmpty {
+			GlobalHub.mu.RLock()
+			agentConn, exists := GlobalHub.Agents[deviceID]
+			GlobalHub.mu.RUnlock()
+			if exists {
+				agentConn.WriteMessage(websocket.TextMessage, []byte(`{"action":"pause"}`))
+			}
+		}
 	}()
 
 	// 挂起连接持续等待监听退订事件和控制指令
@@ -261,13 +267,98 @@ func handleStreamSubscribe(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// 将客户端发来的 WebSocket 文本消息（控制指令）透传给 Agent，降低控制延迟
-		if messageType == websocket.TextMessage {
+		if messageType == websocket.TextMessage || messageType == websocket.BinaryMessage {
+			if messageType == websocket.TextMessage {
+				displayLen := len(payload)
+				if displayLen > 200 {
+					displayLen = 200
+				}
+				log.Printf("[Hub] Subscriber for %s sent text: %s", deviceID, string(payload[:displayLen]))
+			}
 			GlobalHub.mu.RLock()
 			agentConn, exists := GlobalHub.Agents[deviceID]
 			GlobalHub.mu.RUnlock()
 			if exists {
-				agentConn.WriteMessage(websocket.TextMessage, payload)
+				agentConn.WriteMessage(messageType, payload)
+			} else {
+				log.Printf("[Hub] Agent %s not found, cannot forward message", deviceID)
 			}
 		}
 	}
+}
+
+var exeConfigGUID = []byte{0xB9, 0x96, 0x01, 0x58, 0x80, 0x54, 0x4A, 0x19, 0xB7, 0xF7, 0xE9, 0xBE, 0x44, 0x91, 0x4C, 0x18}
+
+func getLocalIP() string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "127.0.0.1"
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip != nil && ip.To4() != nil {
+				return ip.String()
+			}
+		}
+	}
+	return "127.0.0.1"
+}
+
+func handleAgentDownload(w http.ResponseWriter, r *http.Request) {
+	exePath := filepath.Join("..", "agent-rust", "target", "release", "exhibition-agent.exe")
+	if _, err := os.Stat(exePath); os.IsNotExist(err) {
+		exePath = filepath.Join("..", "agent-rust", "target", "debug", "exhibition-agent.exe")
+		if _, err := os.Stat(exePath); os.IsNotExist(err) {
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte("Agent exe not found"))
+			return
+		}
+	}
+
+	host := r.URL.Query().Get("server")
+	if host == "" {
+		host = r.Host
+	}
+	port := "38921"
+	if h, p, err := net.SplitHostPort(host); err == nil {
+		host = h
+		port = p
+	}
+	if host == "localhost" || host == "127.0.0.1" || host == "" {
+		host = getLocalIP()
+	}
+	host = net.JoinHostPort(host, port)
+
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	configJSON, _ := json.Marshal(map[string]string{"server_url": scheme + "://" + host})
+
+	exeData, err := os.ReadFile(exePath)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", "attachment; filename=\"exhibition-agent.exe\"")
+	w.Write(exeData)
+	w.Write(configJSON)
+	binary.Write(w, binary.BigEndian, uint32(len(configJSON)))
+	w.Write(exeConfigGUID)
 }

@@ -6,3 +6,28 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Rust build artifacts
+agent-rust/target/
+server-go/target/
+
+# Compiled executables
+*.exe
+
+# Device-specific IDs
+.device_id
+agent-rust/.device_id
+
+# Log files
+agent_log.txt
+agent_err.txt
+hub_log.txt
+hub_err.txt
+
+# Test scripts
+test_ws.*
+
+# IDE / tooling
+.trae/
+.vscode/
+.idea/
