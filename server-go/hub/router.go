@@ -421,16 +421,33 @@ func getLocalIP() string {
 	return "127.0.0.1"
 }
 
-func handleAgentDownload(w http.ResponseWriter, r *http.Request) {
+func findAgentExe() string {
+	candidates := []string{}
+
 	hubDir := filepath.Dir(os.Args[0])
-	exePath := filepath.Join(hubDir, "..", "agent-rust", "target", "release", "exhibition-agent.exe")
-	if _, err := os.Stat(exePath); os.IsNotExist(err) {
-		exePath = filepath.Join(hubDir, "..", "agent-rust", "target", "debug", "exhibition-agent.exe")
-		if _, err := os.Stat(exePath); os.IsNotExist(err) {
-			w.WriteHeader(http.StatusNotFound)
-			w.Write([]byte("Agent exe not found"))
-			return
+	candidates = append(candidates, filepath.Join(hubDir, "..", "agent-rust", "target", "release", "exhibition-agent.exe"))
+	candidates = append(candidates, filepath.Join(hubDir, "..", "agent-rust", "target", "debug", "exhibition-agent.exe"))
+
+	cwd, _ := os.Getwd()
+	candidates = append(candidates, filepath.Join(cwd, "agent-rust", "target", "release", "exhibition-agent.exe"))
+	candidates = append(candidates, filepath.Join(cwd, "agent-rust", "target", "debug", "exhibition-agent.exe"))
+	candidates = append(candidates, filepath.Join(cwd, "..", "agent-rust", "target", "release", "exhibition-agent.exe"))
+	candidates = append(candidates, filepath.Join(cwd, "..", "agent-rust", "target", "debug", "exhibition-agent.exe"))
+
+	for _, p := range candidates {
+		if _, err := os.Stat(p); err == nil {
+			return p
 		}
+	}
+	return ""
+}
+
+func handleAgentDownload(w http.ResponseWriter, r *http.Request) {
+	exePath := findAgentExe()
+	if exePath == "" {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte("Agent exe not found"))
+		return
 	}
 
 	host := r.URL.Query().Get("server")

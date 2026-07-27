@@ -67,12 +67,10 @@ fn send_key(vk: u16, action: u8) {
         }
     });
 
-    // Convert VK to hardware scan code (Ghost-Keys/Kanata approach for trusted input)
     let scan = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) } as u16;
     println!("[KEY] send_key vk=0x{:02X} scan=0x{:02X} action={}", vk, scan, action);
-    let mut flags = KEYEVENTF_SCANCODE;
+    let mut flags = KEYBD_EVENT_FLAGS(0);
     if action == 1 { flags |= KEYEVENTF_KEYUP; }
-    // Extended keys need KEYEVENTF_EXTENDEDKEY (arrows, PgUp/Dn, Home/End, Ins/Del, RCtrl, RAlt, NumLk, Numpad/)
     let extended = [0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E, 0x6F, 0x90, 0xA3, 0xA5];
     if extended.contains(&vk) { flags |= KEYEVENTF_EXTENDEDKEY; }
 
@@ -80,7 +78,7 @@ fn send_key(vk: u16, action: u8) {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
-                wVk: VIRTUAL_KEY(0),
+                wVk: VIRTUAL_KEY(vk),
                 wScan: scan,
                 dwFlags: flags,
                 time: 0,
