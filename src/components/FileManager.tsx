@@ -46,6 +46,8 @@ interface FileManagerProps {
   onClose: () => void;
   onMinimize?: () => void;
   onTasksChange?: (tasks: TransferTaskItem[]) => void;
+  tasks?: TransferTaskItem[];
+  setTasks?: React.Dispatch<React.SetStateAction<TransferTaskItem[]>>;
   clientRef: React.MutableRefObject<any>;
   deviceName: string;
 }
@@ -383,7 +385,7 @@ const FilePane: React.FC<FilePaneProps> = ({
   );
 };
 
-export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMinimize, onTasksChange, clientRef, deviceName }) => {
+export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMinimize, onTasksChange, tasks: propsTasks, setTasks: propsSetTasks, clientRef, deviceName }) => {
   const [pendingUploads, setPendingUploads] = useState<File[]>([]);
 
   const [remotePath, setRemotePath] = useState("");
@@ -392,7 +394,10 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
 
   const [selectedRemote, setSelectedRemote] = useState<Set<string>>(new Set());
 
-  const [transferTasks, setTransferTasks] = useState<TransferTaskItem[]>([]);
+  const [localTasks, setLocalTasks] = useState<TransferTaskItem[]>([]);
+  const transferTasks = propsTasks || localTasks;
+  const setTransferTasks = propsSetTasks || setLocalTasks;
+
   const [flashingTasks, setFlashingTasks] = useState<Set<string>>(new Set());
   const prevStatusRef = useRef<Record<string, TransferTaskItem["status"]>>({});
 

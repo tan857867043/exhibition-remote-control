@@ -81,6 +81,8 @@ class ExhibitionRemoteClient {
         this._frameSeq = 0;
         this._rAFId = null;
         this._wheelAccum = 0;
+        this._receivedFrames = 0;
+        this._renderedFrames = 0;
 
         // File transfer state
         this._fmCallback = null;
@@ -213,6 +215,7 @@ class ExhibitionRemoteClient {
                     const jpegData = buf.slice(offset + MIN_HEADER_SIZE, offset + regionSize);
 
                     if (frameType === 0x02 || frameType === 0x03 || frameType === 0x04) {
+                        this._receivedFrames++;
                         if (w !== this.offscreenCanvas.width || h !== this.offscreenCanvas.height) {
                             this.offscreenCanvas.width = w;
                             this.offscreenCanvas.height = h;
@@ -257,11 +260,16 @@ class ExhibitionRemoteClient {
         };
     }
 
+    getReceivedFrameCount() { return this._receivedFrames; }
+    getRenderedFrameCount() { return this._renderedFrames; }
+    resetFrameCounters() { this._receivedFrames = 0; this._renderedFrames = 0; }
+
     _scheduleRender() {
         if (this._rAFId === null) {
             this._rAFId = requestAnimationFrame(() => {
                 this._rAFId = null;
                 this.ctx.drawImage(this.offscreenCanvas, 0, 0);
+                this._renderedFrames++;
             });
         }
     }
@@ -525,7 +533,7 @@ class ExhibitionRemoteClient {
             throw new Error('WebSocket not connected');
         }
 
-        const CHUNK_SIZE = 16 * 1024;
+        const CHUNK_SIZE = 512 * 1024; // 512KB per chunk for faster transfer
         const uploadId = 'ul_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
 
         const state = {
@@ -584,6 +592,12 @@ class ExhibitionRemoteClient {
                 const combined = new Uint8Array(1 + chunkData.byteLength);
                 combined.set(header);
                 combined.set(new Uint8Array(chunkData), 1);
+                
+                // Wait if the buffer is full (e.g., > 10MB) to apply backpressure
+                while (this.ws.bufferedAmount > 10 * 1024 * 1024) {
+                    await new Promise(r => setTimeout(r, 10));
+                }
+                
                 this.ws.send(combined.buffer);
 
                 state.sentSize += chunkData.byteLength;
@@ -631,7 +645,7 @@ class ExhibitionRemoteClient {
             totalSize: 0,
             receivedSize: 0,
             chunks: [],
-            windowSize: 4,
+            windowSize: 64, // Increased window size for faster downloads
             onProgress: onProgress,
             readyResolve: null,
             doneResolve: null,

@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import ExhibitionRemoteClient from "./lib/ExhibitionRemoteClient.js";
-import { Monitor, WifiOff, Settings, Mouse, Cast, Lock, Terminal, Router, X, Maximize, Minimize, ChevronLeft, Zap, Image as ImageIcon, Activity, Folder, UploadCloud, Download } from "lucide-react";
-import { FileTransferModal, TransferTask } from "./components/FileTransferModal";
+import { Monitor, WifiOff, Settings, Mouse, Cast, Lock, Terminal, Router, X, Maximize, Minimize, ChevronLeft, Zap, Image as ImageIcon, Activity, Folder, UploadCloud, Download, Copy, Check, Search, Power, RefreshCw } from "lucide-react";
+import { traverseFileTree } from "./lib/fileSystem";
 import { FileManager, TransferTaskItem } from "./components/FileManager";
 
 interface DeviceInfo {
@@ -17,11 +17,20 @@ interface DeviceInfo {
 export default function App() {
   const [serverUrl, setServerUrl] = useState("http://localhost:38921");
   const [devices, setDevices] = useState<DeviceInfo[]>([]);
+  const [knownDevices, setKnownDevices] = useState<DeviceInfo[]>(() => {
+    try {
+      return JSON.parse(localStorage.getItem('exhibition_known_devices') || '[]');
+    } catch (e) {
+      return [];
+    }
+  });
   const [currentDeviceId, setCurrentDeviceId] = useState<string | null>(null);
   const [status, setStatus] = useState<"disconnected" | "loading" | "connected">("disconnected");
   const [viewMode, setViewMode] = useState<"devices" | "remote">("devices");
+
   
-  const [fps, setFps] = useState(0);
+  const [renderedFps, setRenderedFps] = useState(0);
+  const [receivedFps, setReceivedFps] = useState(0);
   const [dataRate, setDataRate] = useState(0);
   const [blockCount, setBlockCount] = useState(0);
   const [resolution, setResolution] = useState("--");
@@ -41,13 +50,35 @@ export default function App() {
   const [editingDeviceId, setEditingDeviceId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
 
-  const [fileModalOpen, setFileModalOpen] = useState(false);
   const [targetDir, setTargetDir] = useState("C:\\Users\\Public\\Downloads");
-  const [transferTasks, setTransferTasks] = useState<TransferTask[]>([]);
   const [isCanvasDragging, setIsCanvasDragging] = useState(false);
   const [fileManagerOpen, setFileManagerOpen] = useState(false);
   const [fileManagerMinimized, setFileManagerMinimized] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
   const [fmTransferTasks, setFmTransferTasks] = useState<TransferTaskItem[]>([]);
+  const [copiedField, setCopiedField] = useState<string | null>(null);
+
+  const filteredDevices = useMemo(() => {
+    let list = knownDevices;
+    if (searchQuery.trim()) {
+      list = knownDevices.filter(d => {
+        const dName = deviceNames[d.id] || d.name || "未命名设备";
+        return dName.toLowerCase().includes(searchQuery.toLowerCase()) || 
+               d.os.toLowerCase().includes(searchQuery.toLowerCase()) ||
+               d.ip.toLowerCase().includes(searchQuery.toLowerCase());
+      });
+    }
+    
+    // Sort online devices first
+    const onlineIds = new Set(devices.map(d => d.id));
+    return list.sort((a, b) => {
+      const aOnline = onlineIds.has(a.id);
+      const bOnline = onlineIds.has(b.id);
+      if (aOnline && !bOnline) return -1;
+      if (!aOnline && bOnline) return 1;
+      return 0;
+    });
+  }, [knownDevices, devices, searchQuery, deviceNames]);
 
   const totalProgress = useMemo(() => {
     const totalSize = fmTransferTasks.reduce((sum, t) => sum + (t.size || 0), 0);
@@ -82,33 +113,36 @@ export default function App() {
     }
     const fileArray = Array.from(files);
 
-    // Send create_dir messages for directory structure before file transfers
     if (directories && directories.length > 0 && clientRef.current.ws && clientRef.current.ws.readyState === WebSocket.OPEN) {
       for (const dirPath of directories) {
         clientRef.current.ws.send(JSON.stringify({ action: "create_dir", path: `${dir}\\${dirPath}` }));
       }
     }
 
-    // Map overwrite mode to string for Agent
     const ov = overwriteMode === "skip" ? "skip" : overwriteMode === "overwrite" ? "overwrite" : "rename";
 
+    // Show the FileManager UI right away to indicate progress
+    setFileManagerOpen(true);
+    setFileManagerMinimized(false);
+
     for (const file of fileArray) {
-      const taskId = `task_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
-      // 保留拖拽文件夹的相对路径结构
+      const taskId = `ul_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
       const relPath = (file as any)._relativePath;
       const fileTargetDir = relPath ? `${dir}\\${relPath}` : dir;
-      const newTask: TransferTask = {
+      
+      const newTask: TransferTaskItem = {
         id: taskId,
-        fileName: relPath ? `${relPath}\\${file.name}` : file.name,
-        fileSize: file.size,
-        targetDir: fileTargetDir,
+        direction: "upload",
+        name: relPath ? `${relPath}\\${file.name}` : file.name,
+        size: file.size,
+        sourcePath: fileTargetDir,
+        targetPath: fileTargetDir,
         progress: 0,
-        speedMBs: 0,
         status: "transferring",
-        timestamp: new Date().toLocaleTimeString(),
+        speed: 0
       };
 
-      setTransferTasks((prev) => [newTask, ...prev]);
+      setFmTransferTasks((prev) => [newTask, ...prev]);
 
       try {
         await clientRef.current.sendFile(
@@ -116,14 +150,14 @@ export default function App() {
           fileTargetDir,
           { overwrite: ov },
           (progress: number, speedMBs: number, status: string) => {
-            setTransferTasks((prev) =>
+            setFmTransferTasks((prev) =>
               prev.map((t) =>
                 t.id === taskId
                   ? {
                       ...t,
                       progress,
-                      speedMBs,
-                      status: status === "completed" ? "completed" : status === "skipped" ? "skipped" : "transferring",
+                      speed: speedMBs,
+                      status: status === "completed" ? "completed" : status === "skipped" ? "completed" : "transferring",
                     }
                   : t
               )
@@ -132,31 +166,15 @@ export default function App() {
         );
       } catch (err: any) {
         console.error("File transfer error:", err);
-        setTransferTasks((prev) =>
+        setFmTransferTasks((prev) =>
           prev.map((t) =>
             t.id === taskId
-              ? { ...t, status: "failed", error: err?.message || "传输失败" }
+              ? { ...t, status: "failed" }
               : t
           )
         );
       }
     }
-  };
-
-  const handleRetryFile = (task: TransferTask) => {
-    // Re-add the failed/skipped file to the queue
-    if (!clientRef.current) {
-      alert("请先连接到远程设备");
-      return;
-    }
-    // Mark the old task as pending and let the queue process it
-    setTransferTasks((prev) =>
-      prev.map((t) =>
-        t.id === task.id
-          ? { ...t, status: "pending" as const, progress: 0, speedMBs: 0, error: undefined }
-          : t
-      )
-    );
   };
 
   const handleCanvasDragOver = (e: React.DragEvent) => {
@@ -171,17 +189,30 @@ export default function App() {
     setIsCanvasDragging(false);
   };
 
-  const handleCanvasDrop = (e: React.DragEvent) => {
+  const handleCanvasDrop = async (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
     setIsCanvasDragging(false);
-    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      setFileModalOpen(true);
+    
+    if (e.dataTransfer.items && e.dataTransfer.items.length > 0) {
+      const allFiles: File[] = [];
+      await traverseFileTree(e.dataTransfer.items, "", allFiles);
+      if (allFiles.length > 0) {
+        // Collect unique directory paths
+        const dirSet = new Set<string>();
+        for (const file of allFiles) {
+          const relPath = (file as any)._relativePath;
+          if (relPath) {
+            dirSet.add(relPath);
+          }
+        }
+        handleSendFiles(allFiles, targetDir, "skip", false, Array.from(dirSet));
+      }
+    } else if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
       handleSendFiles(e.dataTransfer.files, targetDir, "skip", false);
     }
   };
   
-  const fpsCounterRef = useRef(0);
   const bytesReceivedRef = useRef(0);
   const blockCounterRef = useRef(0);
 
@@ -192,6 +223,16 @@ export default function App() {
     return info?.name || id;
   };
 
+  const removeKnownDevice = (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!confirm("确定要从列表中移除该离线设备吗？")) return;
+    setKnownDevices(prev => {
+      const updated = prev.filter(d => d.id !== id);
+      localStorage.setItem('exhibition_known_devices', JSON.stringify(updated));
+      return updated;
+    });
+  };
+
   const loadDevices = async () => {
     if (viewMode === 'remote') return;
     setStatus("loading");
@@ -199,6 +240,15 @@ export default function App() {
       const res = await fetch(`${serverUrl}/api/v1/devices`);
       const data = await res.json();
       setDevices(data);
+      
+      setKnownDevices(prev => {
+        const map = new Map(prev.map(d => [d.id, d]));
+        data.forEach((d: DeviceInfo) => map.set(d.id, d));
+        const updated = Array.from(map.values());
+        localStorage.setItem('exhibition_known_devices', JSON.stringify(updated));
+        return updated;
+      });
+
       setStatus("disconnected");
     } catch (e) {
       console.error(e);
@@ -249,7 +299,6 @@ export default function App() {
       if (canvasRef.current) {
         clientRef.current = new ExhibitionRemoteClient(canvasRef.current, serverUrl, deviceId, (stats: any) => {
           if (stats.type === 'frame') {
-            fpsCounterRef.current++;
             bytesReceivedRef.current += stats.byteLength || 0;
             if (stats.frameType === 0x01) blockCounterRef.current++;
           } else if (stats.type === 'keyboard') {
@@ -261,10 +310,10 @@ export default function App() {
           const origOnClose = clientRef.current.ws.onclose;
           clientRef.current.ws.onclose = (e: CloseEvent) => {
             if (origOnClose) origOnClose.call(clientRef.current.ws, e);
-            setTransferTasks((prev) =>
+            setFmTransferTasks((prev) =>
               prev.map((t) =>
                 t.status === "transferring"
-                  ? { ...t, status: "failed" as const, error: "网络中断" }
+                  ? { ...t, status: "failed", error: "网络中断" }
                   : t
               )
             );
@@ -274,9 +323,10 @@ export default function App() {
       }
     }, 100);
 
-    fpsCounterRef.current = 0;
     bytesReceivedRef.current = 0;
     blockCounterRef.current = 0;
+    setRenderedFps(0);
+    setReceivedFps(0);
   };
 
   const disconnectDevice = () => {
@@ -287,7 +337,8 @@ export default function App() {
     clientRef.current = null;
     setStatus("disconnected");
     setCurrentDeviceId(null);
-    setFps(0);
+    setRenderedFps(0);
+    setReceivedFps(0);
     setDataRate(0);
     setBlockCount(0);
     setResolution("--");
@@ -302,8 +353,11 @@ export default function App() {
     if (viewMode !== 'remote') return;
 
     const fpsTimer = setInterval(() => {
-      setFps(fpsCounterRef.current);
-      fpsCounterRef.current = 0;
+      if (clientRef.current) {
+        setReceivedFps(clientRef.current.getReceivedFrameCount());
+        setRenderedFps(clientRef.current.getRenderedFrameCount());
+        clientRef.current.resetFrameCounters();
+      }
     }, 1000);
 
     const dataRateTimer = setInterval(() => {
@@ -355,6 +409,12 @@ export default function App() {
     } else {
       document.exitFullscreen();
     }
+  };
+
+  const handleCopy = (text: string, field: string) => {
+    navigator.clipboard.writeText(text);
+    setCopiedField(field);
+    setTimeout(() => setCopiedField(null), 2000);
   };
 
   const openDeviceDetails = (id: string, e: React.MouseEvent) => {
@@ -423,7 +483,18 @@ export default function App() {
                       </div>
                       <div className="flex flex-col gap-1">
                         <span className="text-slate-500 font-mono">IP 地址</span>
-                        <span className="text-slate-300 font-mono">{device.ip || 'Unknown'}</span>
+                        <div className="flex items-center justify-between bg-slate-950 px-2 py-1.5 rounded border border-slate-800 group relative">
+                          <span className="text-slate-300 font-mono truncate">{device.ip ? device.ip.split(':')[0] : 'Unknown'}</span>
+                          {device.ip && (
+                            <button 
+                              onClick={() => handleCopy(device.ip.split(':')[0], 'ip')} 
+                              className="text-slate-500 hover:text-indigo-400 transition-colors"
+                              title="复制 IP 地址"
+                            >
+                              {copiedField === 'ip' ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                            </button>
+                          )}
+                        </div>
                       </div>
                       <div className="flex flex-col gap-1">
                         <span className="text-slate-500 font-mono">CPU 信息</span>
@@ -435,7 +506,18 @@ export default function App() {
                       </div>
                       <div className="flex flex-col gap-1 col-span-2">
                         <span className="text-slate-500 font-mono">MAC 地址</span>
-                        <span className="text-slate-300 font-mono">{device.mac || 'Unknown'}</span>
+                        <div className="flex items-center justify-between bg-slate-950 px-2 py-1.5 rounded border border-slate-800 group relative">
+                          <span className="text-slate-300 font-mono truncate">{device.mac ? device.mac.replace(/[^a-fA-F0-9]/g, '').toUpperCase().match(/.{1,2}/g)?.join(':') || 'Unknown' : 'Unknown'}</span>
+                          {device.mac && (
+                            <button 
+                              onClick={() => handleCopy(device.mac.replace(/[^a-fA-F0-9]/g, '').toUpperCase().match(/.{1,2}/g)?.join(':') || '', 'mac')} 
+                              className="text-slate-500 hover:text-indigo-400 transition-colors"
+                              title="复制 MAC 地址"
+                            >
+                              {copiedField === 'mac' ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                            </button>
+                          )}
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -454,41 +536,59 @@ export default function App() {
         <div className="flex flex-col h-full">
           {/* Header */}
           <header className="h-16 bg-slate-900 border-b border-slate-800 flex items-center justify-between px-8 shrink-0">
-            <div className="flex items-center gap-4">
+            <div className="flex items-center gap-6">
               <span className="font-bold tracking-tight text-slate-100 flex items-center gap-3 text-lg">
                 <div className="w-8 h-8 rounded-lg bg-indigo-600 flex items-center justify-center shadow-[0_0_15px_rgba(99,102,241,0.5)]">
                   <Monitor className="w-5 h-5 text-white" />
                 </div>
                 Ultra Remote
               </span>
+              
+              <div className="h-6 w-px bg-slate-800 hidden md:block"></div>
+              
+              <div className="hidden md:flex relative items-center">
+                <Search className="w-4 h-4 text-slate-500 absolute left-3" />
+                <input 
+                  type="text" 
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="搜索设备名称、IP 或系统..."
+                  className="bg-slate-950 border border-slate-700 rounded-lg pl-9 pr-4 py-1.5 text-sm focus:outline-none focus:border-indigo-500/50 text-slate-300 w-[240px] transition-all shadow-inner"
+                />
+              </div>
             </div>
-            <div className="flex items-center gap-4">
-              <input 
-                type="text" 
-                value={serverUrl} 
-                onChange={e => setServerUrl(e.target.value)} 
-                className="bg-slate-950 border border-slate-700 rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-indigo-500/50 text-slate-300 w-64 font-mono shadow-inner" 
-                placeholder="服务端地址" 
-              />
-              <button onClick={loadDevices} className="px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg hover:bg-slate-700 text-sm font-bold transition-all text-slate-200 shadow-sm flex items-center gap-2">
-                <Router className="w-4 h-4" /> 刷新
+            
+            <div className="flex items-center gap-3">
+              <div className="flex items-center bg-slate-950 rounded border border-slate-800 focus-within:border-indigo-500/50 transition-colors">
+                <input 
+                  type="text" 
+                  value={serverUrl}
+                  onChange={(e) => setServerUrl(e.target.value)}
+                  className="bg-transparent border-none outline-none text-xs text-slate-300 font-mono px-3 py-1.5 w-[200px]"
+                  placeholder="WebSocket Server URL"
+                />
+              </div>
+              <button onClick={loadDevices} title="刷新设备列表" className="p-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-slate-300 transition-all flex items-center">
+                <RefreshCw className="w-4 h-4" />
               </button>
-              <button onClick={handleDownloadAgent} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 border border-indigo-500/50 rounded-lg text-sm font-bold transition-all text-white shadow-sm flex items-center gap-2 shadow-[0_0_12px_rgba(99,102,241,0.25)]">
-                <Download className="w-4 h-4" /> 下载 Agent
+              <button onClick={handleDownloadAgent} className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 border border-indigo-500/50 rounded-lg text-xs font-bold transition-all text-white shadow-[0_0_12px_rgba(99,102,241,0.25)] flex items-center gap-2">
+                <Download className="w-3.5 h-3.5" /> Agent
               </button>
             </div>
           </header>
 
           {/* Devices Grid */}
           <main className="flex-1 overflow-y-auto p-8 bg-slate-950">
-            <div className="max-w-6xl mx-auto">
-              <h2 className="text-xl font-bold text-slate-100 mb-6 flex items-center gap-2">
-                <span className="w-2 h-6 bg-indigo-500 rounded-full inline-block"></span>
-                我的设备
-                <span className="ml-2 text-sm font-normal text-slate-500 bg-slate-900 px-2.5 py-0.5 rounded-full border border-slate-800">
-                  {devices.length} 台在线
-                </span>
-              </h2>
+            <div className="max-w-[1400px] mx-auto">
+              <div className="flex items-center justify-between mb-6">
+                <h2 className="text-xl font-bold text-slate-100 flex items-center gap-2">
+                  <span className="w-2 h-6 bg-indigo-500 rounded-full inline-block"></span>
+                  我的设备
+                  <span className="ml-2 text-sm font-normal text-slate-500 bg-slate-900 px-2.5 py-0.5 rounded-full border border-slate-800">
+                    {filteredDevices.length} 台在线
+                  </span>
+                </h2>
+              </div>
 
               {devices.length === 0 ? (
                 <div className="mt-20 flex flex-col items-center justify-center text-slate-500 gap-4">
@@ -498,58 +598,123 @@ export default function App() {
                   <p className="text-lg font-medium text-slate-400">暂无在线设备</p>
                   <p className="text-sm">请在被控端启动 Agent 程序</p>
                 </div>
+              ) : filteredDevices.length === 0 ? (
+                <div className="mt-20 flex flex-col items-center justify-center text-slate-500 gap-4">
+                  <div className="w-24 h-24 rounded-full bg-slate-900 border border-slate-800 flex items-center justify-center">
+                    <Search className="w-10 h-10 opacity-40" />
+                  </div>
+                  <p className="text-lg font-medium text-slate-400">未找到匹配的设备</p>
+                  <p className="text-sm">请尝试其他搜索词</p>
+                </div>
               ) : (
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-4">
-                  {devices.map(device => {
+                  {filteredDevices.map(device => {
                     const id = device.id;
                     const displayName = getDeviceName(id);
+                    
+                    const osLower = (device.os || "").toLowerCase();
+                    const isWindows = osLower.includes('windows');
+                    const isMac = osLower.includes('darwin') || osLower.includes('mac');
+                    const isLinux = osLower.includes('linux');
+                    const isOnline = devices.some(d => d.id === id);
+
                     return (
                       <div 
                         key={id} 
-                        className="bg-slate-900 border border-slate-800 rounded-xl p-3 hover:border-indigo-500/50 hover:shadow-[0_8px_30px_rgba(0,0,0,0.5)] transition-all group flex flex-col gap-3 cursor-pointer overflow-hidden"
-                        onClick={() => connectDevice(id)}
+                        className={`bg-slate-900 border border-slate-800 rounded-xl p-3 transition-all group flex flex-col gap-3 relative ${isOnline ? 'hover:border-indigo-500/50 hover:shadow-[0_8px_30px_rgba(0,0,0,0.5)] cursor-pointer' : 'opacity-60 cursor-default grayscale-[0.5]'}`}
+                        onClick={() => isOnline && connectDevice(id)}
                       >
                         <div className="flex justify-between items-start">
                           <div className="flex items-center gap-2.5">
-                            <div className="w-9 h-9 rounded-full bg-indigo-500/10 flex items-center justify-center shrink-0">
-                              <Monitor className="w-4 h-4 text-indigo-400" />
+                            <div className="w-9 h-9 rounded-full bg-slate-800 flex items-center justify-center shrink-0 shadow-inner">
+                              {isWindows ? (
+                                <Monitor className="w-4 h-4 text-blue-400" />
+                              ) : isMac ? (
+                                <Monitor className="w-4 h-4 text-slate-300" />
+                              ) : isLinux ? (
+                                <Terminal className="w-4 h-4 text-yellow-400" />
+                              ) : (
+                                <Monitor className="w-4 h-4 text-indigo-400" />
+                              )}
                             </div>
                             <div className="flex flex-col min-w-0">
                               <span className="font-bold text-slate-100 text-sm truncate w-full" title={displayName}>{displayName}</span>
-                              <span className="text-[10px] text-emerald-400 flex items-center gap-1 mt-0.5">
-                                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span> 在线可用
-                              </span>
+                              {isOnline ? (
+                                <span className="text-[10px] text-emerald-400 flex items-center gap-1.5 mt-0.5">
+                                  <span className="relative flex h-2 w-2">
+                                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                                    <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                                  </span>
+                                  在线可用
+                                </span>
+                              ) : (
+                                <span className="text-[10px] text-slate-500 flex items-center gap-1.5 mt-0.5">
+                                  <span className="relative flex h-2 w-2">
+                                    <span className="relative inline-flex rounded-full h-2 w-2 bg-slate-600"></span>
+                                  </span>
+                                  设备离线
+                                </span>
+                              )}
                             </div>
                           </div>
-                          <button onClick={(e) => openDeviceDetails(id, e)} className="text-slate-500 hover:text-white p-1.5 rounded-lg hover:bg-slate-800 transition-colors shrink-0">
-                            <Settings className="w-4 h-4" />
-                          </button>
+                          <div className="flex gap-1 shrink-0">
+                            {!isOnline && (
+                               <button onClick={(e) => removeKnownDevice(id, e)} className="text-slate-500 hover:text-red-400 p-1.5 rounded-lg hover:bg-slate-800 transition-colors" title="移除设备">
+                                 <X className="w-3.5 h-3.5" />
+                               </button>
+                            )}
+                            {isOnline && (
+                              <button onClick={(e) => { e.stopPropagation(); }} className="text-slate-500 hover:text-red-400 p-1.5 rounded-lg hover:bg-slate-800 transition-colors" title="重启/关机 (示例)">
+                                <Power className="w-3.5 h-3.5" />
+                              </button>
+                            )}
+                            <button onClick={(e) => openDeviceDetails(id, e)} className="text-slate-500 hover:text-white p-1.5 rounded-lg hover:bg-slate-800 transition-colors" title="设备详情">
+                              <Settings className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
                         </div>
                         
-                        <div className="relative w-full aspect-video bg-black rounded-lg border border-slate-800 overflow-hidden flex items-center justify-center">
-                          <img 
-                            src={`${serverUrl}/api/v1/devices/thumbnail?device_id=${id}&t=${Date.now()}`} 
-                            alt="Screen Thumbnail"
-                            className="w-full h-full object-cover opacity-70 group-hover:opacity-100 transition-opacity"
-                            onError={(e) => {
-                              (e.target as HTMLImageElement).style.display = 'none';
-                              (e.target as HTMLImageElement).parentElement!.innerHTML = '<div class="text-slate-700 flex flex-col items-center"><svg class="w-6 h-6 mb-1" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg><span class="text-[10px]">无缩略图</span></div>';
-                            }}
-                          />
-                          <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 bg-indigo-900/40 transition-opacity">
-                            <div className="bg-indigo-600 text-white rounded-full p-2.5 shadow-lg transform scale-90 group-hover:scale-100 transition-transform">
-                              <Cast className="w-5 h-5" />
+                        <div className="relative w-full aspect-video bg-black rounded-lg border border-slate-800 overflow-hidden flex items-center justify-center group/screen">
+                          {isOnline ? (
+                            <>
+                              <img 
+                                src={`${serverUrl}/api/v1/devices/thumbnail?device_id=${id}&t=${Date.now()}`} 
+                                alt="Screen Thumbnail"
+                                className="w-full h-full object-cover opacity-60 group-hover/screen:opacity-100 transition-opacity"
+                                onError={(e) => {
+                                  (e.target as HTMLImageElement).style.display = 'none';
+                                  (e.target as HTMLImageElement).parentElement!.innerHTML = '<div class="text-slate-700 flex flex-col items-center"><svg class="w-6 h-6 mb-1" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg><span class="text-[10px]">无缩略图</span></div>';
+                                }}
+                              />
+                              <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover/screen:opacity-100 bg-indigo-900/40 backdrop-blur-[2px] transition-all">
+                                <div className="bg-indigo-600 text-white rounded-full p-2.5 shadow-xl transform scale-75 group-hover/screen:scale-100 transition-transform">
+                                  <Cast className="w-5 h-5" />
+                                </div>
+                              </div>
+                            </>
+                          ) : (
+                            <div className="text-slate-700 flex flex-col items-center">
+                              <WifiOff className="w-6 h-6 mb-1" />
+                              <span className="text-[10px]">设备离线</span>
                             </div>
-                          </div>
+                          )}
                         </div>
 
-                        <div className="flex items-center gap-2">
-                          <div className="bg-slate-950 rounded px-2 py-1.5 border border-slate-800 font-mono text-[9px] text-slate-500 truncate flex-1">
-                            ID: {id}
-                          </div>
-                          <div className="bg-slate-950 rounded px-2 py-1.5 border border-slate-800 font-mono text-[9px] text-indigo-400/80 truncate shrink-0 max-w-[80px]">
-                            {device.os || 'Unknown OS'}
-                          </div>
+                        <div className="flex gap-2">
+                          <button 
+                            disabled={!isOnline}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              connectDevice(id);
+                              setFileManagerOpen(true);
+                              setFileManagerMinimized(false);
+                            }}
+                            className={`flex-1 bg-slate-950 rounded-lg py-1.5 border border-slate-800 text-xs flex items-center justify-center gap-1.5 transition-colors
+                              ${isOnline ? 'hover:bg-indigo-600/20 hover:border-indigo-500/30 text-slate-300 hover:text-indigo-300' : 'text-slate-600 cursor-not-allowed opacity-50'}`}
+                          >
+                            <Folder className="w-3.5 h-3.5" />
+                            传文件
+                          </button>
                         </div>
                       </div>
                     );
@@ -622,12 +787,16 @@ export default function App() {
 
               <div className="flex gap-4 text-xs font-mono text-slate-400 mr-2">
                 <div className="flex flex-col items-end">
-                  <span className="text-[9px] uppercase">FPS</span>
-                  <span className={fps > 20 ? "text-emerald-400 font-bold" : "text-amber-400 font-bold"}>{fps}</span>
+                  <span className="text-[9px] uppercase">显示</span>
+                  <span className={renderedFps > 20 ? "text-emerald-400 font-bold" : "text-amber-400 font-bold"}>{renderedFps}</span>
+                </div>
+                <div className="flex flex-col items-end">
+                  <span className="text-[9px] uppercase">接收</span>
+                  <span className="text-blue-400 font-bold">{receivedFps}</span>
                 </div>
                 <div className="flex flex-col items-end">
                   <span className="text-[9px] uppercase">KB/s</span>
-                  <span className="text-blue-400 font-bold">{dataRate}</span>
+                  <span className="text-cyan-400 font-bold">{dataRate}</span>
                 </div>
                 <div className="flex flex-col items-end">
                   <span className="text-[9px] uppercase">Res</span>
@@ -737,22 +906,11 @@ export default function App() {
         </div>
       )}
 
-      <FileTransferModal
-        isOpen={fileModalOpen}
-        onClose={() => setFileModalOpen(false)}
-        deviceName={currentDeviceId ? getDeviceName(currentDeviceId) : "远程设备"}
-        targetDir={targetDir}
-        setTargetDir={setTargetDir}
-        onSendFiles={handleSendFiles}
-        tasks={transferTasks}
-        onClearHistory={() => setTransferTasks([])}
-        onRetryFile={handleRetryFile}
-      />
-
       <FileManager isOpen={fileManagerOpen && status === "connected" && !fileManagerMinimized}
         onClose={() => { setFileManagerOpen(false); setFileManagerMinimized(false); setFmTransferTasks([]); }}
         onMinimize={() => setFileManagerMinimized(true)}
-        onTasksChange={setFmTransferTasks}
+        tasks={fmTransferTasks}
+        setTasks={setFmTransferTasks}
         clientRef={clientRef} deviceName={currentDeviceId ? getDeviceName(currentDeviceId) : ""} />
     </div>
   );
