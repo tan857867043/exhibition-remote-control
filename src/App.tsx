@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import ExhibitionRemoteClient from "./lib/ExhibitionRemoteClient.js";
-import { Monitor, WifiOff, Settings, Mouse, Cast, Lock, Terminal, Router, X, Maximize, Minimize, ChevronLeft, Zap, Image as ImageIcon, Activity, Folder, UploadCloud, Download, Copy, Check, Search, Power, RefreshCw } from "lucide-react";
+import { Monitor, WifiOff, Settings, Mouse, Cast, Lock, Terminal, Router, X, Maximize, Minimize, ChevronLeft, Zap, Image as ImageIcon, Activity, Folder, UploadCloud, Download, Copy, Check, Search, Power, RefreshCw, ChevronUp, ChevronDown, Plus } from "lucide-react";
 import { traverseFileTree } from "./lib/fileSystem";
 import { FileManager, TransferTaskItem } from "./components/FileManager";
 
@@ -12,20 +12,18 @@ interface DeviceInfo {
   cpu: string;
   ram: string;
   mac: string;
+  online: boolean;
+  order: number;
+  tags: string[];
+  added: boolean;
 }
 
 export default function App() {
   const [serverUrl, setServerUrl] = useState("http://localhost:38921");
   const [devices, setDevices] = useState<DeviceInfo[]>([]);
-  const [knownDevices, setKnownDevices] = useState<DeviceInfo[]>(() => {
-    try {
-      return JSON.parse(localStorage.getItem('exhibition_known_devices') || '[]');
-    } catch (e) {
-      return [];
-    }
-  });
+  const [discoveredDevices, setDiscoveredDevices] = useState<DeviceInfo[]>([]);
   const [currentDeviceId, setCurrentDeviceId] = useState<string | null>(null);
-  const [status, setStatus] = useState<"disconnected" | "loading" | "connected">("disconnected");
+  const [status, setStatus] = useState<"disconnected" | "loading" | "connected" | "connecting" | "frozen">("disconnected");
   const [viewMode, setViewMode] = useState<"devices" | "remote">("devices");
 
   
@@ -38,17 +36,11 @@ export default function App() {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [qualityMode, setQualityMode] = useState<"smooth" | "balanced" | "hd">("balanced");
   
-  const [deviceNames, setDeviceNames] = useState<Record<string, string>>(() => {
-    try {
-      return JSON.parse(localStorage.getItem('exhibition_device_names') || '{}');
-    } catch (e) {
-      return {};
-    }
-  });
 
   const [modalOpen, setModalOpen] = useState(false);
   const [editingDeviceId, setEditingDeviceId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
+  const [editingTags, setEditingTags] = useState("");
 
   const [targetDir, setTargetDir] = useState("C:\\Users\\Public\\Downloads");
   const [isCanvasDragging, setIsCanvasDragging] = useState(false);
@@ -58,27 +50,26 @@ export default function App() {
   const [fmTransferTasks, setFmTransferTasks] = useState<TransferTaskItem[]>([]);
   const [copiedField, setCopiedField] = useState<string | null>(null);
 
-  const filteredDevices = useMemo(() => {
-    let list = knownDevices;
-    if (searchQuery.trim()) {
-      list = knownDevices.filter(d => {
-        const dName = deviceNames[d.id] || d.name || "未命名设备";
-        return dName.toLowerCase().includes(searchQuery.toLowerCase()) || 
-               d.os.toLowerCase().includes(searchQuery.toLowerCase()) ||
-               d.ip.toLowerCase().includes(searchQuery.toLowerCase());
-      });
-    }
-    
-    // Sort online devices first
-    const onlineIds = new Set(devices.map(d => d.id));
-    return list.sort((a, b) => {
-      const aOnline = onlineIds.has(a.id);
-      const bOnline = onlineIds.has(b.id);
-      if (aOnline && !bOnline) return -1;
-      if (!aOnline && bOnline) return 1;
-      return 0;
-    });
-  }, [knownDevices, devices, searchQuery, deviceNames]);
+  const q = searchQuery.trim().toLowerCase();
+
+  const onlineDevices = useMemo(() => {
+    return devices
+      .filter(d => d.added && d.online)
+      .filter(d => !q || d.name.toLowerCase().includes(q) || d.os.toLowerCase().includes(q) || d.ip.toLowerCase().includes(q))
+      .sort((a, b) => a.order - b.order);
+  }, [devices, q]);
+
+  const offlineDevices = useMemo(() => {
+    return devices
+      .filter(d => d.added && !d.online)
+      .filter(d => !q || d.name.toLowerCase().includes(q) || d.os.toLowerCase().includes(q) || d.ip.toLowerCase().includes(q))
+      .sort((a, b) => a.order - b.order);
+  }, [devices, q]);
+
+  const filteredDiscovered = useMemo(() => {
+    return discoveredDevices
+      .filter(d => !q || d.name.toLowerCase().includes(q) || d.os.toLowerCase().includes(q) || d.ip.toLowerCase().includes(q));
+  }, [discoveredDevices, q]);
 
   const totalProgress = useMemo(() => {
     const totalSize = fmTransferTasks.reduce((sum, t) => sum + (t.size || 0), 0);
@@ -215,45 +206,80 @@ export default function App() {
   
   const bytesReceivedRef = useRef(0);
   const blockCounterRef = useRef(0);
+  const statsStatusRef = useRef('');
 
   const getDeviceName = (id: string) => {
-    const custom = deviceNames[id];
-    if (custom) return custom;
     const info = devices.find(d => d.id === id);
     return info?.name || id;
   };
 
-  const removeKnownDevice = (id: string, e: React.MouseEvent) => {
+  const handleReorder = async (deviceId: string, direction: 'up' | 'down') => {
+    const sorted = [...devices].filter(d => d.added).sort((a, b) => a.order - b.order);
+    const idx = sorted.findIndex(d => d.id === deviceId);
+    if (idx === -1) return;
+    const swapIdx = direction === 'up' ? idx - 1 : idx + 1;
+    if (swapIdx < 0 || swapIdx >= sorted.length) return;
+    [sorted[idx], sorted[swapIdx]] = [sorted[swapIdx], sorted[idx]];
+    const newOrder = sorted.map(d => d.id);
+    try {
+      await fetch(`${serverUrl}/api/v1/devices/reorder`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ order: newOrder })
+      });
+      loadDevices();
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const handleRemoveDevice = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
     if (!confirm("确定要从列表中移除该离线设备吗？")) return;
-    setKnownDevices(prev => {
-      const updated = prev.filter(d => d.id !== id);
-      localStorage.setItem('exhibition_known_devices', JSON.stringify(updated));
-      return updated;
-    });
+    try {
+      await fetch(`${serverUrl}/api/v1/devices/remove`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ device_id: id })
+      });
+      loadDevices();
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const handleAddDevice = async (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      await fetch(`${serverUrl}/api/v1/devices/add`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ device_id: id })
+      });
+      loadDevices();
+    } catch (e) {
+      console.error(e);
+    }
   };
 
   const loadDevices = async () => {
     if (viewMode === 'remote') return;
     setStatus("loading");
     try {
-      const res = await fetch(`${serverUrl}/api/v1/devices`);
-      const data = await res.json();
-      setDevices(data);
-      
-      setKnownDevices(prev => {
-        const map = new Map(prev.map(d => [d.id, d]));
-        data.forEach((d: DeviceInfo) => map.set(d.id, d));
-        const updated = Array.from(map.values());
-        localStorage.setItem('exhibition_known_devices', JSON.stringify(updated));
-        return updated;
-      });
-
+      const [allRes, discoveredRes] = await Promise.all([
+        fetch(`${serverUrl}/api/v1/devices`),
+        fetch(`${serverUrl}/api/v1/devices/discovered`)
+      ]);
+      const all = await allRes.json();
+      const discovered = await discoveredRes.json();
+      setDevices(all);
+      setDiscoveredDevices(discovered);
       setStatus("disconnected");
     } catch (e) {
       console.error(e);
       setStatus("disconnected");
       setDevices([]);
+      setDiscoveredDevices([]);
     }
   };
 
@@ -286,10 +312,10 @@ export default function App() {
     if (!deviceId) return;
 
     if (clientRef.current) {
-      if (clientRef.current.ws) clientRef.current.ws.close();
-      clientRef.current.releaseKeyboard();
+      clientRef.current.destroy();
     }
 
+    statsStatusRef.current = '';
     setCurrentDeviceId(deviceId);
     setViewMode("remote");
     setStatus("connecting");
@@ -301,15 +327,25 @@ export default function App() {
           if (stats.type === 'frame') {
             bytesReceivedRef.current += stats.byteLength || 0;
             if (stats.frameType === 0x01) blockCounterRef.current++;
+            if (statsStatusRef.current !== 'connected') {
+              statsStatusRef.current = 'connected';
+              setStatus('connected');
+            }
           } else if (stats.type === 'keyboard') {
             setKeyboardCaptured(stats.captured);
+          } else if (stats.type === 'freeze') {
+            if (statsStatusRef.current !== 'frozen') {
+              statsStatusRef.current = 'frozen';
+              setStatus('frozen');
+            }
           }
         });
         // Override ws.onclose to mark transferring tasks as failed on disconnect
-        if (clientRef.current.ws) {
+        if (clientRef.current?.ws) {
           const origOnClose = clientRef.current.ws.onclose;
+          const ws = clientRef.current.ws;
           clientRef.current.ws.onclose = (e: CloseEvent) => {
-            if (origOnClose) origOnClose.call(clientRef.current.ws, e);
+            if (origOnClose) origOnClose.call(ws, e);
             setFmTransferTasks((prev) =>
               prev.map((t) =>
                 t.status === "transferring"
@@ -331,10 +367,10 @@ export default function App() {
 
   const disconnectDevice = () => {
     if (clientRef.current) {
-      clientRef.current.releaseKeyboard();
-      if (clientRef.current.ws) clientRef.current.ws.close();
+      clientRef.current.destroy();
     }
     clientRef.current = null;
+    statsStatusRef.current = '';
     setStatus("disconnected");
     setCurrentDeviceId(null);
     setRenderedFps(0);
@@ -419,23 +455,257 @@ export default function App() {
 
   const openDeviceDetails = (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
+    const device = devices.find(d => d.id === id);
     setEditingDeviceId(id);
-    setEditingName(deviceNames[id] || "");
+    setEditingName(device?.name || "");
+    setEditingTags(device?.tags?.join(", ") || "");
     setModalOpen(true);
   };
 
-  const saveDeviceDetails = () => {
+  const saveDeviceDetails = async () => {
     if (!editingDeviceId) return;
-    const newNames = { ...deviceNames };
-    const trimmed = editingName.trim();
-    if (trimmed) {
-      newNames[editingDeviceId] = trimmed;
-    } else {
-      delete newNames[editingDeviceId];
+    try {
+      await fetch(`${serverUrl}/api/v1/devices/rename`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ device_id: editingDeviceId, name: editingName.trim() })
+      });
+      await fetch(`${serverUrl}/api/v1/devices/tags`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          device_id: editingDeviceId,
+          tags: editingTags.split(",").map(t => t.trim()).filter(Boolean)
+        })
+      });
+      setModalOpen(false);
+      loadDevices();
+    } catch (e) {
+      console.error(e);
     }
-    setDeviceNames(newNames);
-    localStorage.setItem('exhibition_device_names', JSON.stringify(newNames));
-    setModalOpen(false);
+  };
+
+  const renderDeviceCard = (device: DeviceInfo, section: 'online' | 'offline' | 'discovered') => {
+    const id = device.id;
+    const displayName = device.name || "未命名设备";
+    const osLower = (device.os || "").toLowerCase();
+    const isWindows = osLower.includes('windows');
+    const isMac = osLower.includes('darwin') || osLower.includes('mac');
+    const isLinux = osLower.includes('linux');
+    const isOnline = section === 'online';
+    const isDiscovered = section === 'discovered';
+
+    const cardStyle = isOnline
+      ? 'hover:border-emerald-500/50 hover:shadow-[0_8px_30px_rgba(0,0,0,0.5)] cursor-pointer'
+      : isDiscovered
+        ? 'border-amber-500/30 hover:border-amber-500/50 bg-slate-900 hover:shadow-[0_8px_30px_rgba(0,0,0,0.5)] cursor-pointer'
+        : 'opacity-60 cursor-default grayscale-[0.5]';
+
+    return (
+      <div
+        key={id}
+        className={`bg-slate-900 border border-slate-800 rounded-xl p-3 transition-all group flex flex-col gap-3 relative ${cardStyle}`}
+        onClick={() => { if (isOnline) connectDevice(id); }}
+      >
+        {/* Sort handle with up/down arrows */}
+        {!isDiscovered && (
+          <div className="absolute left-1 top-1/2 -translate-y-1/2 flex flex-col gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+            <button
+              onClick={(e) => { e.stopPropagation(); handleReorder(id, 'up'); }}
+              className="text-slate-600 hover:text-slate-300 p-0.5 rounded hover:bg-slate-800 transition-colors"
+              title="上移"
+            >
+              <ChevronUp className="w-3.5 h-3.5" />
+            </button>
+            <button
+              onClick={(e) => { e.stopPropagation(); handleReorder(id, 'down'); }}
+              className="text-slate-600 hover:text-slate-300 p-0.5 rounded hover:bg-slate-800 transition-colors"
+              title="下移"
+            >
+              <ChevronDown className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
+
+        <div className="flex justify-between items-start pl-5">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className="w-9 h-9 rounded-full bg-slate-800 flex items-center justify-center shrink-0 shadow-inner">
+              {isWindows ? (
+                <Monitor className="w-4 h-4 text-blue-400" />
+              ) : isMac ? (
+                <Monitor className="w-4 h-4 text-slate-300" />
+              ) : isLinux ? (
+                <Terminal className="w-4 h-4 text-yellow-400" />
+              ) : (
+                <Monitor className="w-4 h-4 text-indigo-400" />
+              )}
+            </div>
+            <div className="flex flex-col min-w-0">
+              <span className="font-bold text-slate-100 text-sm truncate w-full" title={displayName}>{displayName}</span>
+              {isOnline ? (
+                <span className="text-[10px] text-emerald-400 flex items-center gap-1.5 mt-0.5">
+                  <span className="relative flex h-2 w-2">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                  </span>
+                  在线可用
+                </span>
+              ) : isDiscovered ? (
+                <span className="text-[10px] text-amber-400 flex items-center gap-1.5 mt-0.5">
+                  <span className="relative flex h-2 w-2">
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-500"></span>
+                  </span>
+                  发现新设备
+                </span>
+              ) : (
+                <span className="text-[10px] text-slate-500 flex items-center gap-1.5 mt-0.5">
+                  <span className="relative flex h-2 w-2">
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-slate-600"></span>
+                  </span>
+                  设备离线
+                </span>
+              )}
+              {/* Tag badges */}
+              {device.tags && device.tags.length > 0 && (
+                <div className="flex flex-wrap gap-1 mt-1.5">
+                  {device.tags.map((tag, i) => (
+                    <span
+                      key={i}
+                      className={`text-[9px] font-mono px-1.5 py-0.5 rounded-full border ${
+                        isOnline
+                          ? 'bg-emerald-950/50 text-emerald-300 border-emerald-800/50'
+                          : isDiscovered
+                            ? 'bg-amber-950/50 text-amber-300 border-amber-800/50'
+                            : 'bg-slate-800 text-slate-400 border-slate-700'
+                      }`}
+                    >
+                      {tag}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+          <div className="flex gap-1 shrink-0">
+            {isDiscovered ? (
+              <button onClick={(e) => handleAddDevice(id, e)} className="text-amber-400 hover:text-amber-300 p-1.5 rounded-lg hover:bg-amber-900/30 transition-colors" title="添加设备">
+                <Plus className="w-4 h-4" />
+              </button>
+            ) : (
+              <>
+                {!isOnline && (
+                  <button onClick={(e) => handleRemoveDevice(id, e)} className="text-slate-500 hover:text-red-400 p-1.5 rounded-lg hover:bg-slate-800 transition-colors" title="移除设备">
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
+                {isOnline && (
+                  <button onClick={(e) => { e.stopPropagation(); }} className="text-slate-500 hover:text-red-400 p-1.5 rounded-lg hover:bg-slate-800 transition-colors" title="重启/关机 (示例)">
+                    <Power className="w-3.5 h-3.5" />
+                  </button>
+                )}
+                <button onClick={(e) => openDeviceDetails(id, e)} className="text-slate-500 hover:text-white p-1.5 rounded-lg hover:bg-slate-800 transition-colors" title="设备详情">
+                  <Settings className="w-3.5 h-3.5" />
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+        
+        <div className="relative w-full aspect-video bg-black rounded-lg border border-slate-800 overflow-hidden flex items-center justify-center group/screen">
+          {isOnline ? (
+            <>
+              <img 
+                src={`${serverUrl}/api/v1/devices/thumbnail?device_id=${id}&t=${Date.now()}`} 
+                alt="Screen Thumbnail"
+                className="w-full h-full object-cover opacity-60 group-hover/screen:opacity-100 transition-opacity"
+                onError={(e) => {
+                  const img = e.target as HTMLImageElement;
+                  img.style.display = 'none';
+                  const parent = img.parentElement;
+                  if (parent && !parent.querySelector('.thumbnail-fallback')) {
+                    const fallback = document.createElement('div');
+                    fallback.className = 'thumbnail-fallback text-slate-700 flex flex-col items-center';
+                    fallback.innerHTML = '<svg class="w-6 h-6 mb-1" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg><span class="text-[10px]">无缩略图</span></div>';
+                    parent.appendChild(fallback);
+                  }
+                }}
+              />
+              <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover/screen:opacity-100 bg-indigo-900/40 backdrop-blur-[2px] transition-all">
+                <div className="bg-indigo-600 text-white rounded-full p-2.5 shadow-xl transform scale-75 group-hover/screen:scale-100 transition-transform">
+                  <Cast className="w-5 h-5" />
+                </div>
+              </div>
+            </>
+          ) : (
+            <div className="text-slate-700 flex flex-col items-center">
+              <WifiOff className="w-6 h-6 mb-1" />
+              <span className="text-[10px]">{isDiscovered ? '待添加' : '设备离线'}</span>
+            </div>
+          )}
+        </div>
+
+        {!isDiscovered && (
+          <div className="flex gap-2">
+            <button 
+              disabled={!isOnline}
+              onClick={(e) => {
+                e.stopPropagation();
+                connectDevice(id);
+                setFileManagerOpen(true);
+                setFileManagerMinimized(false);
+              }}
+              className={`flex-1 bg-slate-950 rounded-lg py-1.5 border border-slate-800 text-xs flex items-center justify-center gap-1.5 transition-colors
+                ${isOnline ? 'hover:bg-indigo-600/20 hover:border-indigo-500/30 text-slate-300 hover:text-indigo-300' : 'text-slate-600 cursor-not-allowed opacity-50'}`}
+            >
+              <Folder className="w-3.5 h-3.5" />
+              传文件
+            </button>
+            {isDiscovered && (
+              <button
+                onClick={(e) => handleAddDevice(id, e)}
+                className="flex-1 bg-amber-600/20 hover:bg-amber-600/30 border border-amber-500/30 rounded-lg py-1.5 text-xs flex items-center justify-center gap-1.5 text-amber-300 transition-colors"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                添加
+              </button>
+            )}
+          </div>
+        )}
+
+        {isDiscovered && (
+          <button
+            onClick={(e) => handleAddDevice(id, e)}
+            className="w-full bg-amber-600/20 hover:bg-amber-600/30 border border-amber-500/30 rounded-lg py-2 text-xs flex items-center justify-center gap-1.5 text-amber-300 transition-colors font-bold"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            添加设备
+          </button>
+        )}
+      </div>
+    );
+  };
+
+  const renderSection = (title: string, icon: React.ReactNode, iconColor: string, devices: DeviceInfo[], sectionType: 'online' | 'offline' | 'discovered', emptyText: string) => {
+    return (
+      <div className="mb-8">
+        <div className="flex items-center gap-2 mb-4">
+          {icon}
+          <h3 className="text-md font-bold text-slate-200">{title}</h3>
+          <span className={`text-xs font-mono px-2 py-0.5 rounded-full border ${iconColor}`}>
+            {devices.length}
+          </span>
+        </div>
+        {devices.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-10 text-slate-500 gap-2 bg-slate-900/30 rounded-xl border border-slate-800/50">
+            <p className="text-sm">{emptyText}</p>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-4">
+            {devices.map(device => renderDeviceCard(device, sectionType))}
+          </div>
+        )}
+      </div>
+    );
   };
 
   return (
@@ -468,6 +738,16 @@ export default function App() {
                   onChange={(e) => setEditingName(e.target.value)} 
                   className="bg-slate-950 border border-slate-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-indigo-500/50 text-slate-200 placeholder-slate-600" 
                   placeholder="例如：大厅主屏幕" 
+                />
+              </div>
+              <div className="flex flex-col gap-1.5">
+                <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">标签 (逗号分隔)</label>
+                <input 
+                  type="text" 
+                  value={editingTags} 
+                  onChange={(e) => setEditingTags(e.target.value)} 
+                  className="bg-slate-950 border border-slate-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-indigo-500/50 text-slate-200 placeholder-slate-600 font-mono" 
+                  placeholder="例如：展厅A, 主屏幕, 触控一体机" 
                 />
               </div>
 
@@ -577,7 +857,7 @@ export default function App() {
             </div>
           </header>
 
-          {/* Devices Grid */}
+          {/* Three-section Layout */}
           <main className="flex-1 overflow-y-auto p-8 bg-slate-950">
             <div className="max-w-[1400px] mx-auto">
               <div className="flex items-center justify-between mb-6">
@@ -585,141 +865,39 @@ export default function App() {
                   <span className="w-2 h-6 bg-indigo-500 rounded-full inline-block"></span>
                   我的设备
                   <span className="ml-2 text-sm font-normal text-slate-500 bg-slate-900 px-2.5 py-0.5 rounded-full border border-slate-800">
-                    {filteredDevices.length} 台在线
+                    {onlineDevices.length} 台在线 / {offlineDevices.length} 台离线
                   </span>
                 </h2>
               </div>
 
-              {devices.length === 0 ? (
-                <div className="mt-20 flex flex-col items-center justify-center text-slate-500 gap-4">
-                  <div className="w-24 h-24 rounded-full bg-slate-900 border border-slate-800 flex items-center justify-center">
-                    <WifiOff className="w-10 h-10 opacity-40" />
-                  </div>
-                  <p className="text-lg font-medium text-slate-400">暂无在线设备</p>
-                  <p className="text-sm">请在被控端启动 Agent 程序</p>
-                </div>
-              ) : filteredDevices.length === 0 ? (
-                <div className="mt-20 flex flex-col items-center justify-center text-slate-500 gap-4">
-                  <div className="w-24 h-24 rounded-full bg-slate-900 border border-slate-800 flex items-center justify-center">
-                    <Search className="w-10 h-10 opacity-40" />
-                  </div>
-                  <p className="text-lg font-medium text-slate-400">未找到匹配的设备</p>
-                  <p className="text-sm">请尝试其他搜索词</p>
-                </div>
-              ) : (
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-4">
-                  {filteredDevices.map(device => {
-                    const id = device.id;
-                    const displayName = getDeviceName(id);
-                    
-                    const osLower = (device.os || "").toLowerCase();
-                    const isWindows = osLower.includes('windows');
-                    const isMac = osLower.includes('darwin') || osLower.includes('mac');
-                    const isLinux = osLower.includes('linux');
-                    const isOnline = devices.some(d => d.id === id);
+              {/* Section 1: Online Devices */}
+              {renderSection(
+                '在线设备',
+                <span className="w-2.5 h-2.5 rounded-full bg-emerald-400"></span>,
+                'text-emerald-400 border-emerald-800/50 bg-emerald-950/30',
+                onlineDevices,
+                'online',
+                searchQuery.trim() ? '未找到匹配的在线设备' : '暂无在线设备'
+              )}
 
-                    return (
-                      <div 
-                        key={id} 
-                        className={`bg-slate-900 border border-slate-800 rounded-xl p-3 transition-all group flex flex-col gap-3 relative ${isOnline ? 'hover:border-indigo-500/50 hover:shadow-[0_8px_30px_rgba(0,0,0,0.5)] cursor-pointer' : 'opacity-60 cursor-default grayscale-[0.5]'}`}
-                        onClick={() => isOnline && connectDevice(id)}
-                      >
-                        <div className="flex justify-between items-start">
-                          <div className="flex items-center gap-2.5">
-                            <div className="w-9 h-9 rounded-full bg-slate-800 flex items-center justify-center shrink-0 shadow-inner">
-                              {isWindows ? (
-                                <Monitor className="w-4 h-4 text-blue-400" />
-                              ) : isMac ? (
-                                <Monitor className="w-4 h-4 text-slate-300" />
-                              ) : isLinux ? (
-                                <Terminal className="w-4 h-4 text-yellow-400" />
-                              ) : (
-                                <Monitor className="w-4 h-4 text-indigo-400" />
-                              )}
-                            </div>
-                            <div className="flex flex-col min-w-0">
-                              <span className="font-bold text-slate-100 text-sm truncate w-full" title={displayName}>{displayName}</span>
-                              {isOnline ? (
-                                <span className="text-[10px] text-emerald-400 flex items-center gap-1.5 mt-0.5">
-                                  <span className="relative flex h-2 w-2">
-                                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                                    <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
-                                  </span>
-                                  在线可用
-                                </span>
-                              ) : (
-                                <span className="text-[10px] text-slate-500 flex items-center gap-1.5 mt-0.5">
-                                  <span className="relative flex h-2 w-2">
-                                    <span className="relative inline-flex rounded-full h-2 w-2 bg-slate-600"></span>
-                                  </span>
-                                  设备离线
-                                </span>
-                              )}
-                            </div>
-                          </div>
-                          <div className="flex gap-1 shrink-0">
-                            {!isOnline && (
-                               <button onClick={(e) => removeKnownDevice(id, e)} className="text-slate-500 hover:text-red-400 p-1.5 rounded-lg hover:bg-slate-800 transition-colors" title="移除设备">
-                                 <X className="w-3.5 h-3.5" />
-                               </button>
-                            )}
-                            {isOnline && (
-                              <button onClick={(e) => { e.stopPropagation(); }} className="text-slate-500 hover:text-red-400 p-1.5 rounded-lg hover:bg-slate-800 transition-colors" title="重启/关机 (示例)">
-                                <Power className="w-3.5 h-3.5" />
-                              </button>
-                            )}
-                            <button onClick={(e) => openDeviceDetails(id, e)} className="text-slate-500 hover:text-white p-1.5 rounded-lg hover:bg-slate-800 transition-colors" title="设备详情">
-                              <Settings className="w-3.5 h-3.5" />
-                            </button>
-                          </div>
-                        </div>
-                        
-                        <div className="relative w-full aspect-video bg-black rounded-lg border border-slate-800 overflow-hidden flex items-center justify-center group/screen">
-                          {isOnline ? (
-                            <>
-                              <img 
-                                src={`${serverUrl}/api/v1/devices/thumbnail?device_id=${id}&t=${Date.now()}`} 
-                                alt="Screen Thumbnail"
-                                className="w-full h-full object-cover opacity-60 group-hover/screen:opacity-100 transition-opacity"
-                                onError={(e) => {
-                                  (e.target as HTMLImageElement).style.display = 'none';
-                                  (e.target as HTMLImageElement).parentElement!.innerHTML = '<div class="text-slate-700 flex flex-col items-center"><svg class="w-6 h-6 mb-1" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg><span class="text-[10px]">无缩略图</span></div>';
-                                }}
-                              />
-                              <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover/screen:opacity-100 bg-indigo-900/40 backdrop-blur-[2px] transition-all">
-                                <div className="bg-indigo-600 text-white rounded-full p-2.5 shadow-xl transform scale-75 group-hover/screen:scale-100 transition-transform">
-                                  <Cast className="w-5 h-5" />
-                                </div>
-                              </div>
-                            </>
-                          ) : (
-                            <div className="text-slate-700 flex flex-col items-center">
-                              <WifiOff className="w-6 h-6 mb-1" />
-                              <span className="text-[10px]">设备离线</span>
-                            </div>
-                          )}
-                        </div>
+              {/* Section 2: Offline Devices */}
+              {renderSection(
+                '离线设备',
+                <span className="w-2.5 h-2.5 rounded-full bg-slate-500"></span>,
+                'text-slate-400 border-slate-700 bg-slate-800/50',
+                offlineDevices,
+                'offline',
+                searchQuery.trim() ? '未找到匹配的离线设备' : '暂无离线设备'
+              )}
 
-                        <div className="flex gap-2">
-                          <button 
-                            disabled={!isOnline}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              connectDevice(id);
-                              setFileManagerOpen(true);
-                              setFileManagerMinimized(false);
-                            }}
-                            className={`flex-1 bg-slate-950 rounded-lg py-1.5 border border-slate-800 text-xs flex items-center justify-center gap-1.5 transition-colors
-                              ${isOnline ? 'hover:bg-indigo-600/20 hover:border-indigo-500/30 text-slate-300 hover:text-indigo-300' : 'text-slate-600 cursor-not-allowed opacity-50'}`}
-                          >
-                            <Folder className="w-3.5 h-3.5" />
-                            传文件
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
+              {/* Section 3: Discovered Devices */}
+              {renderSection(
+                '发现新设备',
+                <span className="w-2.5 h-2.5 rounded-full bg-amber-400"></span>,
+                'text-amber-400 border-amber-800/50 bg-amber-950/30',
+                filteredDiscovered,
+                'discovered',
+                searchQuery.trim() ? '未找到匹配的新设备' : '暂无新设备发现'
               )}
             </div>
           </main>
@@ -829,7 +1007,7 @@ export default function App() {
             />
 
             {/* Keyboard Capture Hint Overlay */}
-            {status === "connected" && !keyboardCaptured && (
+            {!keyboardCaptured && !fileManagerOpen && (
               <div 
                 className="absolute inset-0 z-30 flex items-center justify-center bg-slate-950/70 backdrop-blur-sm cursor-pointer select-none"
                 onClick={() => clientRef.current?.captureKeyboard()}
@@ -920,7 +1098,7 @@ export default function App() {
         </div>
       )}
 
-      <FileManager isOpen={fileManagerOpen && status === "connected" && !fileManagerMinimized}
+      <FileManager isOpen={fileManagerOpen && !fileManagerMinimized}
         onClose={() => { setFileManagerOpen(false); setFileManagerMinimized(false); setFmTransferTasks([]); }}
         onMinimize={() => setFileManagerMinimized(true)}
         tasks={fmTransferTasks}

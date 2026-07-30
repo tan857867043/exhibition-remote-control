@@ -46,6 +46,7 @@ pub fn build_binary_packet(
     w: u16,
     h: u16,
     jpeg_bytes: &[u8],
+    cursor_type: u8,
 ) -> Vec<u8> {
     let mut packet = Vec::with_capacity(14 + jpeg_bytes.len());
     packet.push(frame_type);
@@ -55,7 +56,7 @@ pub fn build_binary_packet(
     packet.extend_from_slice(&h.to_be_bytes());
     let jpeg_len = jpeg_bytes.len() as u32;
     packet.extend_from_slice(&jpeg_len.to_be_bytes());
-    packet.push(0);
+    packet.push(cursor_type);
     packet.extend_from_slice(jpeg_bytes);
     packet
 }

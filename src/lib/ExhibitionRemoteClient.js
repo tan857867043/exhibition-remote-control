@@ -61,6 +61,10 @@ class ExhibitionRemoteClient {
         this.deviceId = deviceId;
         this.onStats = onStats;
 
+        // 清空 canvas，防止旧画面残留
+        this.ctx.fillStyle = '#0f172a';
+        this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+
         this.offscreenCanvas = document.createElement('canvas');
         this.offscreenCtx = this.offscreenCanvas.getContext('2d', { alpha: false });
         this.offscreenCtx.imageSmoothingEnabled = false;
@@ -82,6 +86,8 @@ class ExhibitionRemoteClient {
         this._receivedFrames = 0;
         this._renderedFrames = 0;
         this._inputDisabled = false; // 文件管理器等弹窗打开时禁用远程输入，防止穿透
+        this._lastFrameTime = Date.now();
+        this._freezeCheckTimer = null;
 
         // File transfer state
         this._fmCallback = null;
@@ -117,6 +123,7 @@ class ExhibitionRemoteClient {
         this.ws.onopen = () => {
             console.log("Connected to device stream");
             this.setQuality(50);
+            this._startFreezeCheck();
         };
 
         this.ws.onmessage = async (e) => {
@@ -136,6 +143,15 @@ class ExhibitionRemoteClient {
                 return;
             }
             const buf = new Uint8Array(e.data);
+
+            // 独立光标消息 [0x0A, cursor_type]: 不依赖视频帧，即时更新 CSS cursor
+            if (buf.length === 2 && buf[0] === 0x0A) {
+                if (this.currentCursorType !== buf[1]) {
+                    this.currentCursorType = buf[1];
+                    this.updateCursorStyle();
+                }
+                return;
+            }
 
             if (buf.length >= 4 && buf[0] === 0x01 && buf[1] === 0x00 && buf[2] === 0x00 && this._downloadState) {
                 const state = this._downloadState;
@@ -180,6 +196,7 @@ class ExhibitionRemoteClient {
             }
 
             this.onStats({ type: 'frame', byteLength: buf.length });
+            this._lastFrameTime = Date.now();
 
             if (this._processingVideo) return;
             this._processingVideo = true;
@@ -198,6 +215,12 @@ class ExhibitionRemoteClient {
                     const h = (buf[offset + 7] << 8) | buf[offset + 8];
                     const jpegLen = (buf[offset + 9] << 24) | (buf[offset + 10] << 16) | (buf[offset + 11] << 8) | buf[offset + 12];
                     cursorType = buf[offset + 13];
+
+                    // 帧头中 cursorType 已就绪，立即更新 CSS cursor（不等 JPEG 解码和渲染）
+                    if (this.currentCursorType !== cursorType) {
+                        this.currentCursorType = cursorType;
+                        this.updateCursorStyle();
+                    }
 
                     if (frameType === 0x01) {
                         this.onStats({ type: 'frame', frameType: 0x01, byteLength: 0 });
@@ -236,10 +259,6 @@ class ExhibitionRemoteClient {
 
                 if (mySeq === this._frameSeq) {
                     this._scheduleRender();
-                    if (this.currentCursorType !== cursorType) {
-                        this.currentCursorType = cursorType;
-                        this.updateCursorStyle();
-                    }
                 }
             } finally {
                 this._processingVideo = false;
@@ -248,6 +267,7 @@ class ExhibitionRemoteClient {
 
         this.ws.onclose = () => {
             console.log("Disconnected from device stream");
+            this._stopFreezeCheck();
             if (this._downloadState && this._downloadState.errorReject) {
                 this._downloadState.errorReject(new Error('disconnected'));
             }
@@ -257,6 +277,33 @@ class ExhibitionRemoteClient {
             this._downloadState = null;
             this._uploadState = null;
         };
+    }
+
+    _startFreezeCheck() {
+        this._stopFreezeCheck();
+        this._lastFrameTime = Date.now();
+        this._freezeCheckTimer = setInterval(() => {
+            const elapsed = Date.now() - this._lastFrameTime;
+            if (elapsed > 15000 && this.onStats) {
+                this.onStats({ type: 'freeze', elapsedMs: elapsed });
+            }
+        }, 1000);
+    }
+
+    _stopFreezeCheck() {
+        if (this._freezeCheckTimer) {
+            clearInterval(this._freezeCheckTimer);
+            this._freezeCheckTimer = null;
+        }
+    }
+
+    destroy() {
+        this._stopFreezeCheck();
+        if (this._rAFId) cancelAnimationFrame(this._rAFId);
+        if (this.ws) {
+            try { this.ws.close(); } catch(e) {}
+        }
+        this.releaseKeyboard();
     }
 
     getReceivedFrameCount() { return this._receivedFrames; }
@@ -719,9 +766,6 @@ class ExhibitionRemoteClient {
 
     disableInput() {
         this._inputDisabled = true;
-        if (this.keyboardCaptured) {
-            this.releaseKeyboard();
-        }
     }
 
     enableInput() {

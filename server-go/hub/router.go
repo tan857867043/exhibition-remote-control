@@ -30,6 +30,8 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func InitRouter() {
+	GlobalHub.DeviceStorage = loadDeviceStorage()
+
 	// 1. Rust Agent 接入通道
 	http.HandleFunc("/agent/register", handleAgentRegister)
 
@@ -39,10 +41,23 @@ func InitRouter() {
 	http.HandleFunc("/api/v1/stream", handleStreamSubscribe)
 	http.HandleFunc("/api/v1/control", corsMiddleware(handleExternalControl))
 	http.HandleFunc("/agents", corsMiddleware(handleAgentDownload))
+
+	// 3. 设备管理 API
+	http.HandleFunc("/api/v1/devices/discovered", corsMiddleware(handleDiscoveredDevices))
+	http.HandleFunc("/api/v1/devices/add", corsMiddleware(handleAddDevice))
+	http.HandleFunc("/api/v1/devices/remove", corsMiddleware(handleRemoveDevice))
+	http.HandleFunc("/api/v1/devices/rename", corsMiddleware(handleRenameDevice))
+	http.HandleFunc("/api/v1/devices/reorder", corsMiddleware(handleReorderDevices))
+	http.HandleFunc("/api/v1/devices/tags", corsMiddleware(handleUpdateTags))
 }
 
 // 接收 Rust Agent 的画面数据并高效流式分发给所有第三方订阅者
 func handleAgentRegister(w http.ResponseWriter, r *http.Request) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[Hub] PANIC recovered in handleAgentRegister: %v", r)
+		}
+	}()
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Println("Upgrade error:", err)
@@ -69,7 +84,9 @@ func handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 
 	GlobalHub.mu.Lock()
 	GlobalHub.Agents[deviceID] = conn
-	GlobalHub.DeviceInfos[deviceID] = DeviceInfo{
+	GlobalHub.mu.Unlock()
+
+	FindOrRegisterDevice(deviceID, DeviceInfo{
 		ID:   deviceID,
 		Name: deviceName,
 		OS:   deviceOS,
@@ -77,14 +94,13 @@ func handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 		CPU:  deviceCPU,
 		RAM:  deviceRAM,
 		MAC:  deviceMAC,
-	}
-	GlobalHub.mu.Unlock()
+	})
 
 	defer func() {
 		GlobalHub.mu.Lock()
 		delete(GlobalHub.Agents, deviceID)
-		delete(GlobalHub.DeviceInfos, deviceID)
 		GlobalHub.mu.Unlock()
+		MarkDeviceOffline(deviceID)
 		conn.Close()
 	}()
 
@@ -110,7 +126,7 @@ func handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 				for subConn := range subs {
 					if ch, ok := channels[subConn]; ok {
 						select {
-						case ch <- payload:
+						case ch <- FrameMsg{MsgType: websocket.BinaryMessage, Payload: payload}:
 							// 正常发送
 						default:
 							// 通道满：drain 掉最旧的帧，然后推送最新的
@@ -119,7 +135,7 @@ func handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 							default:
 							}
 							select {
-							case ch <- payload:
+							case ch <- FrameMsg{MsgType: websocket.BinaryMessage, Payload: payload}:
 							default:
 							}
 						}
@@ -127,11 +143,26 @@ func handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 				}
 				GlobalHub.mu.RUnlock()
 			} else {
-				// 非视频二进制消息（如下载分块 0x01 等）直接转发给订阅者
+				// 非视频二进制消息（如下载分块 0x01 等）通过缓冲通道转发，避免并发写 WS
 				GlobalHub.mu.RLock()
 				subs := GlobalHub.Subscribers[deviceID]
+				channels := GlobalHub.SubscriberChannels[deviceID]
 				for subConn := range subs {
-					subConn.WriteMessage(websocket.BinaryMessage, payload)
+					if ch, ok := channels[subConn]; ok {
+						select {
+						case ch <- FrameMsg{MsgType: websocket.BinaryMessage, Payload: payload}:
+						default:
+							// 通道满，丢弃旧消息，推最新的
+							select {
+							case <-ch:
+							default:
+							}
+							select {
+							case ch <- FrameMsg{MsgType: websocket.BinaryMessage, Payload: payload}:
+							default:
+							}
+						}
+					}
 				}
 				GlobalHub.mu.RUnlock()
 			}
@@ -143,9 +174,15 @@ func handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[Hub] Agent %s sent text: %s", deviceID, string(payload[:displayLen]))
 			GlobalHub.mu.RLock()
 			subs := GlobalHub.Subscribers[deviceID]
+			channels := GlobalHub.SubscriberChannels[deviceID]
 			log.Printf("[Hub] Forwarding text to %d subscribers", len(subs))
 			for subConn := range subs {
-				subConn.WriteMessage(websocket.TextMessage, payload)
+				if ch, ok := channels[subConn]; ok {
+					select {
+					case ch <- FrameMsg{MsgType: websocket.TextMessage, Payload: payload}:
+					default:
+					}
+				}
 			}
 			GlobalHub.mu.RUnlock()
 		}
@@ -191,15 +228,7 @@ func handleExternalControl(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleListDevices(w http.ResponseWriter, r *http.Request) {
-	GlobalHub.mu.RLock()
-	list := make([]DeviceInfo, 0, len(GlobalHub.DeviceInfos))
-	for _, info := range GlobalHub.DeviceInfos {
-		if info.Name == "" {
-			info.Name = info.ID
-		}
-		list = append(list, info)
-	}
-	GlobalHub.mu.RUnlock()
+	list := GetKnownDeviceList()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(list)
@@ -245,7 +274,7 @@ func handleStreamSubscribe(w http.ResponseWriter, r *http.Request) {
 	deviceID := r.URL.Query().Get("device_id")
 
 	// 创建缓冲通道（容量4），足够吸收瞬发爆发帧，满了就 drain 旧帧保持最新
-	ch := make(chan []byte, 4)
+	ch := make(chan FrameMsg, 4)
 
 	GlobalHub.mu.Lock()
 	wasEmpty := len(GlobalHub.Subscribers[deviceID]) == 0
@@ -255,7 +284,7 @@ func handleStreamSubscribe(w http.ResponseWriter, r *http.Request) {
 	GlobalHub.Subscribers[deviceID][conn] = true
 
 	if GlobalHub.SubscriberChannels[deviceID] == nil {
-		GlobalHub.SubscriberChannels[deviceID] = make(map[*websocket.Conn]chan []byte)
+		GlobalHub.SubscriberChannels[deviceID] = make(map[*websocket.Conn]chan FrameMsg)
 	}
 	GlobalHub.SubscriberChannels[deviceID][conn] = ch
 	GlobalHub.mu.Unlock()
@@ -267,8 +296,8 @@ func handleStreamSubscribe(w http.ResponseWriter, r *http.Request) {
 				log.Println("[Hub] Recovered in subscriber writer:", r)
 			}
 		}()
-		for payload := range ch {
-			if err := conn.WriteMessage(websocket.BinaryMessage, payload); err != nil {
+		for msg := range ch {
+			if err := conn.WriteMessage(msg.MsgType, msg.Payload); err != nil {
 				break
 			}
 		}
@@ -482,4 +511,127 @@ func handleAgentDownload(w http.ResponseWriter, r *http.Request) {
 	w.Write(configJSON)
 	binary.Write(w, binary.BigEndian, uint32(len(configJSON)))
 	w.Write(exeConfigGUID)
+}
+
+func handleDiscoveredDevices(w http.ResponseWriter, r *http.Request) {
+	list := GetDiscoveredDevices()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(list)
+}
+
+func handleAddDevice(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		w.Write([]byte(`{"error":"method not allowed"}`))
+		return
+	}
+	var req struct {
+		ID string `json:"device_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid request"}`))
+		return
+	}
+	if AddDeviceToKnown(req.ID) {
+		w.Write([]byte(`{"status":"ok"}`))
+	} else {
+		w.WriteHeader(http.StatusConflict)
+		w.Write([]byte(`{"error":"device already exists"}`))
+	}
+}
+
+func handleRemoveDevice(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		w.Write([]byte(`{"error":"method not allowed"}`))
+		return
+	}
+	var req struct {
+		ID string `json:"device_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid request"}`))
+		return
+	}
+	if RemoveDeviceFromKnown(req.ID) {
+		w.Write([]byte(`{"status":"ok"}`))
+	} else {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"error":"device not found"}`))
+	}
+}
+
+func handleRenameDevice(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		w.Write([]byte(`{"error":"method not allowed"}`))
+		return
+	}
+	var req struct {
+		ID   string `json:"device_id"`
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == "" || req.Name == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid request"}`))
+		return
+	}
+	if RenameDevice(req.ID, req.Name) {
+		w.Write([]byte(`{"status":"ok"}`))
+	} else {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"error":"device not found"}`))
+	}
+}
+
+func handleReorderDevices(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		w.Write([]byte(`{"error":"method not allowed"}`))
+		return
+	}
+	var req struct {
+		Order []string `json:"order"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Order) == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid request"}`))
+		return
+	}
+	if ReorderDevices(req.Order) {
+		w.Write([]byte(`{"status":"ok"}`))
+	} else {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":"reorder failed"}`))
+	}
+}
+
+func handleUpdateTags(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		w.Write([]byte(`{"error":"method not allowed"}`))
+		return
+	}
+	var req struct {
+		ID   string   `json:"device_id"`
+		Tags []string `json:"tags"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid request"}`))
+		return
+	}
+	if UpdateDeviceTags(req.ID, req.Tags) {
+		w.Write([]byte(`{"status":"ok"}`))
+	} else {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"error":"device not found"}`))
+	}
 }
