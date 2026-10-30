@@ -1,1 +1,202 @@
 @import "tailwindcss";
+
+/* ═══════════════════════════════════════════════
+   Ultra Remote — Design Token System
+   Dark technical workbench theme
+   Primary: Blue / Neutral: Slate / Status: Emerald/Amber/Red
+   ═══════════════════════════════════════════════ */
+
+:root {
+  /* ── Brand Primary Scale (Blue) ── */
+  --ur-primary-50: #eff6ff;
+  --ur-primary-100: #dbeafe;
+  --ur-primary-200: #bfdbfe;
+  --ur-primary-300: #93c5fd;
+  --ur-primary-400: #60a5fa;
+  --ur-primary-500: #3b82f6;
+  --ur-primary-600: #2563eb;
+  --ur-primary-700: #1d4ed8;
+  --ur-primary-800: #1e40af;
+  --ur-primary-900: #1e3a8a;
+  --ur-primary-950: #172554;
+
+  /* ── Background & Surface ── */
+  --ur-background: #0a0e1a;
+  --ur-foreground: #e2e8f0;
+  --ur-card: #111827;
+  --ur-card-foreground: #e2e8f0;
+  --ur-popover: #1e293b;
+  --ur-popover-foreground: #f1f5f9;
+
+  /* ── Muted / Secondary Surface ── */
+  --ur-muted: #1e293b;
+  --ur-muted-foreground: #94a3b8;
+  --ur-border: #1e293b;
+  --ur-input: #1e293b;
+  --ur-ring: #3b82f6;
+
+  /* ── Status Colors ── */
+  --ur-state-success: #10b981;
+  --ur-state-success-foreground: #d1fae5;
+  --ur-state-success-bg: #064e3b;
+  --ur-state-warning: #f59e0b;
+  --ur-state-warning-foreground: #fef3c7;
+  --ur-state-warning-bg: #78350f;
+  --ur-state-error: #ef4444;
+  --ur-state-error-foreground: #fee2e2;
+  --ur-state-error-bg: #7f1d1d;
+  --ur-state-info: #3b82f6;
+  --ur-state-info-foreground: #dbeafe;
+  --ur-state-info-bg: #1e3a5f;
+
+  /* ── Radius Scale ── */
+  --ur-radius-sm: 4px;
+  --ur-radius-md: 8px;
+  --ur-radius-lg: 12px;
+
+  /* ── Typography ── */
+  --ur-font-sans: "Inter", "SF Pro Display", -apple-system, "Segoe UI", system-ui, sans-serif;
+  --ur-font-mono: "JetBrains Mono", "SF Mono", "Cascadia Code", "Fira Code", monospace;
+}
+
+/* ═══ Tailwind v4 @theme inline mapping ═══ */
+@theme inline {
+  --color-background: var(--ur-background);
+  --color-foreground: var(--ur-foreground);
+  --color-card: var(--ur-card);
+  --color-card-foreground: var(--ur-card-foreground);
+  --color-popover: var(--ur-popover);
+  --color-popover-foreground: var(--ur-popover-foreground);
+  --color-primary: var(--ur-primary-600);
+  --color-primary-foreground: var(--ur-primary-50);
+  --color-muted: var(--ur-muted);
+  --color-muted-foreground: var(--ur-muted-foreground);
+  --color-border: var(--ur-border);
+  --color-input: var(--ur-input);
+  --color-ring: var(--ur-ring);
+  --color-success: var(--ur-state-success);
+  --color-warning: var(--ur-state-warning);
+  --color-error: var(--ur-state-error);
+
+  --radius-sm: var(--ur-radius-sm);
+  --radius-md: var(--ur-radius-md);
+  --radius-lg: var(--ur-radius-lg);
+
+  --font-sans: var(--ur-font-sans);
+  --font-mono: var(--ur-font-mono);
+}
+
+/* ═══ Semantic Token Fallback ═══ */
+@layer base {
+  :root {
+    --background: var(--ur-background);
+    --foreground: var(--ur-foreground);
+    --card: var(--ur-card);
+    --card-foreground: var(--ur-card-foreground);
+    --popover: var(--ur-popover);
+    --popover-foreground: var(--ur-popover-foreground);
+    --primary: var(--ur-primary-600);
+    --primary-foreground: var(--ur-primary-50);
+    --secondary: var(--ur-muted);
+    --secondary-foreground: var(--ur-muted-foreground);
+    --muted: var(--ur-muted);
+    --muted-foreground: var(--ur-muted-foreground);
+    --accent: var(--ur-primary-800);
+    --accent-foreground: var(--ur-primary-50);
+    --destructive: var(--ur-state-error);
+    --destructive-foreground: var(--ur-state-error-foreground);
+    --border: var(--ur-border);
+    --input: var(--ur-input);
+    --ring: var(--ur-ring);
+    --radius: var(--ur-radius-md);
+  }
+
+  body {
+    background: var(--ur-background);
+    color: var(--ur-foreground);
+    font-family: var(--ur-font-sans);
+    -webkit-font-smoothing: antialiased;
+  }
+}
+
+/* ═══ Custom Scrollbar ═══ */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--ur-muted);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--ur-muted-foreground);
+}
+
+/* ═══ Ping Animation ═══ */
+@keyframes ur-ping {
+  75%, 100% {
+    transform: scale(2);
+    opacity: 0;
+  }
+}
+.ur-ping {
+  animation: ur-ping 1.5s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+
+/* ═══ App Shell Layout ═══ */
+.app-shell {
+  display: flex;
+  height: 100vh;
+  overflow: hidden;
+}
+.app-sidebar {
+  flex: 0 0 240px;
+}
+.app-main-col {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.app-header {
+  height: 56px;
+  flex-shrink: 0;
+}
+.app-scroll {
+  flex: 1;
+  overflow-y: auto;
+}
+
+/* ═══════════════════════════════════════════════
+   Light Theme Overlay — 与 Tailwind @theme/@layer base 同源映射
+   ═══════════════════════════════════════════════ */
+:root[data-theme="light"] {
+  --ur-background: #f8fafc;
+  --ur-foreground: #0f172a;
+  --ur-card: #ffffff;
+  --ur-card-foreground: #0f172a;
+  --ur-popover: #ffffff;
+  --ur-popover-foreground: #0f172a;
+
+  --ur-muted: #f1f5f9;
+  --ur-muted-foreground: #64748b;
+  --ur-border: #e2e8f0;
+  --ur-input: #e2e8f0;
+  --ur-ring: #2563eb;
+
+  --ur-state-success: #059669;
+  --ur-state-success-foreground: #064e3b;
+  --ur-state-success-bg: #d1fae5;
+  --ur-state-warning: #d97706;
+  --ur-state-warning-foreground: #78350f;
+  --ur-state-warning-bg: #fef3c7;
+  --ur-state-error: #dc2626;
+  --ur-state-error-foreground: #7f1d1d;
+  --ur-state-error-bg: #fee2e2;
+  --ur-state-info: #2563eb;
+  --ur-state-info-foreground: #1e3a5f;
+  --ur-state-info-bg: #dbeafe;
+}

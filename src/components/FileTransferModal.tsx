@@ -56,9 +56,19 @@ async function traverseFileTree(items: DataTransferItemList, relativePath: strin
       result.push(file);
     } else if (entry.isDirectory) {
       const dirReader = (entry as FileSystemDirectoryEntry).createReader();
-      const entries = await new Promise<FileSystemEntry[]>((resolve) => {
-        dirReader.readEntries(resolve);
+      // readEntries 可能分多批返回（每批最多 100 条），需要循环读取，否则大目录内容丢失
+      const getEntries = (): Promise<FileSystemEntry[]> => new Promise((resolve) => {
+        const all: FileSystemEntry[] = [];
+        const readBatch = () => {
+          dirReader.readEntries((batch) => {
+            if (batch.length === 0) { resolve(all); return; }
+            all.push(...batch);
+            readBatch();
+          });
+        };
+        readBatch();
       });
+      const entries = await getEntries();
       const subPath = relativePath ? `${relativePath}\\${entry.name}` : entry.name;
       for (const subEntry of entries) {
         await traverseEntry(subEntry, subPath, result);
@@ -111,6 +121,7 @@ export const FileTransferModal: React.FC<FileTransferModalProps> = ({
 }) => {
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
   const [overwriteMode, setOverwriteMode] = useState("skip");
   const [applyToAll, setApplyToAll] = useState(false);
 
@@ -167,27 +178,27 @@ export const FileTransferModal: React.FC<FileTransferModalProps> = ({
   const activeTask = tasks.find((t) => t.status === "transferring");
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-md p-4 animate-in fade-in duration-200">
-      <div className="bg-slate-900 border border-slate-800 w-full max-w-2xl rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[85vh]">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 backdrop-blur-md p-4 animate-in fade-in duration-200">
+      <div className="bg-card border border-border w-full max-w-2xl rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[85vh]">
         {/* Header */}
-        <div className="px-6 py-4 bg-slate-900/90 border-b border-slate-800 flex items-center justify-between">
+        <div className="px-6 py-4 bg-card border-b border-border flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="p-2.5 bg-blue-500/10 border border-blue-500/20 text-blue-400 rounded-xl">
+            <div className="p-2.5 bg-primary/10 border border-primary/20 text-primary rounded-xl">
               <FolderUp className="w-5 h-5" />
             </div>
             <div>
-              <h3 className="text-base font-bold text-slate-100 flex items-center gap-2">
+              <h3 className="text-base font-bold text-foreground flex items-center gap-2">
                 远程文件传输
-                <span className="text-xs font-medium px-2 py-0.5 bg-blue-500/10 text-blue-400 border border-blue-500/20 rounded-full">
+                <span className="text-xs font-medium px-2 py-0.5 bg-primary/10 text-primary border border-primary/20 rounded-full">
                   {deviceName}
                 </span>
               </h3>
-              <p className="text-xs text-slate-400">支持拖拽投送与自定义保存路径，局域网高速传输</p>
+              <p className="text-xs text-muted-foreground">支持拖拽投送与自定义保存路径，局域网高速传输</p>
             </div>
           </div>
           <button
             onClick={onClose}
-            className="p-2 text-slate-400 hover:text-white hover:bg-slate-800 rounded-lg transition-colors"
+            className="p-2 text-muted-foreground hover:text-foreground hover:bg-muted rounded-lg transition-colors"
           >
             <X className="w-5 h-5" />
           </button>
@@ -196,7 +207,7 @@ export const FileTransferModal: React.FC<FileTransferModalProps> = ({
         <div className="p-6 overflow-y-auto space-y-5 flex-1 custom-scrollbar">
           {/* Target Directory Selection */}
           <div>
-            <label className="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2">
+            <label className="block text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">
               远程文件保存位置 (可自定义 Path)
             </label>
             <div className="flex items-center gap-2 mb-2.5">
@@ -206,7 +217,7 @@ export const FileTransferModal: React.FC<FileTransferModalProps> = ({
                   value={targetDir}
                   onChange={(e) => setTargetDir(e.target.value)}
                   placeholder="请输入远程保存目录，例如: C:\Users\Public\Downloads"
-                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-xs text-slate-200 focus:outline-none focus:border-blue-500 transition-colors"
+                  className="w-full bg-background border border-border rounded-xl px-3.5 py-2.5 text-xs text-foreground focus:outline-none focus:border-primary transition-colors"
                 />
               </div>
             </div>
@@ -222,13 +233,13 @@ export const FileTransferModal: React.FC<FileTransferModalProps> = ({
                     onClick={() => setTargetDir(preset.path)}
                     className={`flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-medium transition-all ${
                       isSelected
-                        ? "bg-blue-600/20 border-blue-500/50 text-blue-300"
-                        : "bg-slate-950/50 border-slate-800 text-slate-400 hover:text-slate-200 hover:border-slate-700"
+                        ? "bg-primary/20 border-primary/50 text-primary"
+                        : "bg-background/50 border-border text-muted-foreground hover:text-foreground hover:border-muted-foreground"
                     }`}
                   >
-                    <Icon className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+                    <Icon className="w-3.5 h-3.5 text-primary shrink-0" />
                     <span className="truncate">{preset.label}</span>
-                    {isSelected && <Check className="w-3 h-3 text-blue-400 ml-auto shrink-0" />}
+                    {isSelected && <Check className="w-3 h-3 text-primary ml-auto shrink-0" />}
                   </button>
                 );
               })}
@@ -238,23 +249,23 @@ export const FileTransferModal: React.FC<FileTransferModalProps> = ({
           {/* Conflict Strategy */}
           <div className="flex items-center gap-4 flex-wrap">
             <div className="flex items-center gap-2">
-              <label className="text-xs font-medium text-slate-400">冲突策略:</label>
+              <label className="text-xs font-medium text-muted-foreground">冲突策略:</label>
               <select
                 value={overwriteMode}
                 onChange={(e) => setOverwriteMode(e.target.value)}
-                className="bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-blue-500 transition-colors"
+                className="bg-background border border-border rounded-lg px-3 py-2 text-xs text-foreground focus:outline-none focus:border-primary transition-colors"
               >
                 <option value="skip">跳过</option>
                 <option value="overwrite">覆盖</option>
                 <option value="rename">重命名</option>
               </select>
             </div>
-            <label className="flex items-center gap-2 text-xs text-slate-400 cursor-pointer select-none">
+            <label className="flex items-center gap-2 text-xs text-muted-foreground cursor-pointer select-none">
               <input
                 type="checkbox"
                 checked={applyToAll}
                 onChange={(e) => setApplyToAll(e.target.checked)}
-                className="rounded border-slate-700 bg-slate-950 text-blue-500 focus:ring-blue-500/50"
+                className="rounded border-border bg-background text-primary focus:ring-primary/50"
               />
               全部应用
             </label>
@@ -268,8 +279,8 @@ export const FileTransferModal: React.FC<FileTransferModalProps> = ({
             onClick={() => fileInputRef.current?.click()}
             className={`border-2 border-dashed rounded-2xl p-8 text-center cursor-pointer transition-all flex flex-col items-center justify-center gap-3 ${
               isDragging
-                ? "border-blue-500 bg-blue-500/10 scale-[1.01]"
-                : "border-slate-800 hover:border-blue-500/50 bg-slate-950/40 hover:bg-slate-950/80"
+                ? "border-primary bg-primary/10 scale-[1.01]"
+                : "border-border hover:border-primary/50 bg-background/40 hover:bg-background/80"
             }`}
           >
             <input
@@ -279,30 +290,51 @@ export const FileTransferModal: React.FC<FileTransferModalProps> = ({
               multiple
               className="hidden"
             />
-            <div className="w-12 h-12 rounded-2xl bg-slate-800/80 border border-slate-700/50 flex items-center justify-center text-blue-400 shadow-inner">
+            <input
+              ref={folderInputRef}
+              type="file"
+              className="hidden"
+              {...{ webkitdirectory: "", directory: "" } as any}
+              onChange={handleFileSelect}
+            />
+            <div className="w-12 h-12 rounded-2xl bg-muted border border-border flex items-center justify-center text-primary shadow-inner">
               <UploadCloud className="w-6 h-6 animate-pulse" />
             </div>
             <div>
-              <p className="text-sm font-semibold text-slate-200">
-                点击选择文件 或 将文件拖拽至此处
+              <p className="text-sm font-semibold text-foreground">
+                点击选择文件 或 将文件/文件夹拖拽至此处
               </p>
-              <p className="text-xs text-slate-400 mt-1">
-                目标路径: <span className="text-blue-400 font-mono">{targetDir || "C:\\Users\\Public\\Downloads"}</span>
+              <p className="text-xs text-muted-foreground mt-1">
+                目标路径: <span className="text-primary font-mono">{targetDir || "D:\\"}</span>
               </p>
+            </div>
+            <div className="flex items-center gap-2 mt-1">
+              <button
+                onClick={(e) => { e.stopPropagation(); fileInputRef.current?.click(); }}
+                className="px-3 py-1.5 rounded-lg border border-border bg-background text-xs text-foreground hover:border-primary/50 transition-colors"
+              >
+                选择文件（可多选）
+              </button>
+              <button
+                onClick={(e) => { e.stopPropagation(); folderInputRef.current?.click(); }}
+                className="px-3 py-1.5 rounded-lg border border-border bg-background text-xs text-foreground hover:border-primary/50 transition-colors"
+              >
+                选择文件夹（保留层级）
+              </button>
             </div>
           </div>
 
           {/* Active / Recent Transfers */}
           <div>
             <div className="flex items-center justify-between mb-3">
-              <h4 className="text-xs font-semibold text-slate-300 uppercase tracking-wider flex items-center gap-2">
-                <Clock className="w-3.5 h-3.5 text-slate-400" />
+              <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider flex items-center gap-2">
+                <Clock className="w-3.5 h-3.5 text-muted-foreground" />
                 传输队列与历史 ({tasks.length})
               </h4>
               {tasks.length > 0 && (
                 <button
                   onClick={onClearHistory}
-                  className="text-[11px] text-slate-400 hover:text-slate-200 transition-colors"
+                  className="text-[11px] text-muted-foreground hover:text-foreground transition-colors"
                 >
                   清空历史记录
                 </button>
@@ -330,13 +362,13 @@ export const FileTransferModal: React.FC<FileTransferModalProps> = ({
               };
               return (
                 <div className="flex items-center gap-4 mb-3 text-xs">
-                  <span className="text-slate-400">
-                    <span className="text-blue-400 font-semibold">{doneCount}</span>
-                    <span className="text-slate-500">/{totalTasks} 个文件</span>
+                  <span className="text-muted-foreground">
+                    <span className="text-primary font-semibold">{doneCount}</span>
+                    <span className="text-muted-foreground">/{totalTasks} 个文件</span>
                   </span>
                   {etaSeconds > 0 && (
-                    <span className="text-slate-500">
-                      预计剩余 <span className="text-amber-400 font-mono">{formatETA(etaSeconds)}</span>
+                    <span className="text-muted-foreground">
+                      预计剩余 <span className="text-warning font-mono">{formatETA(etaSeconds)}</span>
                     </span>
                   )}
                 </div>
@@ -344,25 +376,25 @@ export const FileTransferModal: React.FC<FileTransferModalProps> = ({
             })()}
 
             {tasks.length === 0 ? (
-              <div className="py-8 text-center border border-slate-800/60 rounded-xl bg-slate-950/30 text-slate-500 text-xs">
+              <div className="py-8 text-center border border-border rounded-xl bg-background/30 text-muted-foreground text-xs">
                 暂无传输任务，选择文件即可开始投送
               </div>
             ) : (
               <div className="space-y-2.5 max-h-52 overflow-y-auto pr-1 custom-scrollbar">
                 {tasks.map((task) => {
                   const statusColors: Record<string, string> = {
-                    transferring: "border-blue-500/30",
-                    completed: "border-emerald-500/30",
-                    failed: "border-rose-500/30",
-                    skipped: "border-amber-500/30",
-                    pending: "border-slate-700",
+                    transferring: "border-primary/30",
+                    completed: "border-success/30",
+                    failed: "border-error/30",
+                    skipped: "border-warning/30",
+                    pending: "border-border",
                   };
                   const statusBadgeColors: Record<string, string> = {
-                    transferring: "text-blue-400 bg-blue-500/10 border-blue-500/20",
-                    completed: "text-emerald-400 bg-emerald-500/10 border-emerald-500/20",
-                    failed: "text-rose-400 bg-rose-500/10 border-rose-500/20",
-                    skipped: "text-amber-400 bg-amber-500/10 border-amber-500/20",
-                    pending: "text-slate-400 bg-slate-800 border-slate-700",
+                    transferring: "text-primary bg-primary/10 border-primary/20",
+                    completed: "text-success bg-success/10 border-success/20",
+                    failed: "text-error bg-error/10 border-error/20",
+                    skipped: "text-warning bg-warning/10 border-warning/20",
+                    pending: "text-muted-foreground bg-muted border-border",
                   };
                   const statusLabels: Record<string, string> = {
                     transferring: "传输中",
@@ -372,41 +404,41 @@ export const FileTransferModal: React.FC<FileTransferModalProps> = ({
                     pending: "等待中",
                   };
                   const progressBarColor: Record<string, string> = {
-                    transferring: "bg-blue-500",
-                    completed: "bg-emerald-500",
-                    failed: "bg-rose-500",
-                    skipped: "bg-amber-500",
-                    pending: "bg-slate-600",
+                    transferring: "bg-primary",
+                    completed: "bg-success",
+                    failed: "bg-error",
+                    skipped: "bg-warning",
+                    pending: "bg-muted-foreground",
                   };
                   return (
                     <div
                       key={task.id}
-                      className={`p-3 bg-slate-950/60 border rounded-xl flex flex-col gap-2 ${statusColors[task.status] || "border-slate-800/80"}`}
+                      className={`p-3 bg-background/60 border rounded-xl flex flex-col gap-2 ${statusColors[task.status] || "border-border"}`}
                     >
                       <div className="flex items-center justify-between gap-3">
                         <div className="flex items-center gap-2.5 min-w-0">
                           <FileText className={`w-4 h-4 shrink-0 ${
-                            task.status === "transferring" ? "text-blue-400" :
-                            task.status === "completed" ? "text-emerald-400" :
-                            task.status === "failed" ? "text-rose-400" :
-                            task.status === "skipped" ? "text-amber-400" :
-                            "text-slate-500"
+                            task.status === "transferring" ? "text-primary" :
+                            task.status === "completed" ? "text-success" :
+                            task.status === "failed" ? "text-error" :
+                            task.status === "skipped" ? "text-warning" :
+                            "text-muted-foreground"
                           }`} />
                           <div className="min-w-0">
-                            <p className="text-xs font-medium text-slate-200 truncate">{task.fileName}</p>
-                            <p className="text-[10px] text-slate-400 truncate">
+                            <p className="text-xs font-medium text-foreground truncate">{task.fileName}</p>
+                            <p className="text-[10px] text-muted-foreground truncate">
                               {formatSize(task.fileSize)} • 保存至 {task.targetDir}
                             </p>
                             {/* Error message for failed tasks */}
                             {task.status === "failed" && task.error && (
-                              <p className="text-[10px] text-rose-400 mt-0.5">{task.error}</p>
+                              <p className="text-[10px] text-error mt-0.5">{task.error}</p>
                             )}
                           </div>
                         </div>
 
                         <div className="flex items-center gap-2 shrink-0">
                           {task.status === "transferring" && (
-                            <span className="text-[11px] font-mono font-semibold text-blue-400">
+                            <span className="text-[11px] font-mono font-semibold text-primary">
                               {task.speedMBs.toFixed(1)} MB/s
                             </span>
                           )}
@@ -419,7 +451,7 @@ export const FileTransferModal: React.FC<FileTransferModalProps> = ({
                           {(task.status === "failed" || task.status === "skipped") && (
                             <button
                               onClick={() => onRetryFile(task)}
-                              className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-700 transition-colors"
+                              className="p-1 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
                               title="重试"
                             >
                               <RefreshCw className="w-3.5 h-3.5" />
@@ -431,13 +463,13 @@ export const FileTransferModal: React.FC<FileTransferModalProps> = ({
                       {/* Progress Bar for transferring */}
                       {task.status === "transferring" && (
                         <div className="space-y-1">
-                          <div className="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                          <div className="w-full bg-muted rounded-full h-1.5 overflow-hidden">
                             <div
                               className={`${progressBarColor[task.status]} h-full transition-all duration-150 rounded-full`}
                               style={{ width: `${task.progress}%` }}
                             />
                           </div>
-                          <div className="flex justify-between text-[10px] text-slate-400 font-mono">
+                          <div className="flex justify-between text-[10px] text-muted-foreground font-mono">
                             <span>传输中...</span>
                             <span>{task.progress}%</span>
                           </div>
@@ -452,11 +484,11 @@ export const FileTransferModal: React.FC<FileTransferModalProps> = ({
         </div>
 
         {/* Footer */}
-        <div className="px-6 py-3.5 bg-slate-900/90 border-t border-slate-800 flex items-center justify-between text-xs text-slate-400">
+        <div className="px-6 py-3.5 bg-card border-t border-border flex items-center justify-between text-xs text-muted-foreground">
           <span>提示: 传输采用零内存缓冲流式分发</span>
           <button
             onClick={onClose}
-            className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium rounded-xl transition-colors"
+            className="px-4 py-2 bg-muted hover:bg-muted text-foreground font-medium rounded-xl transition-colors"
           >
             关闭窗口
           </button>

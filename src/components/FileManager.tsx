@@ -7,6 +7,7 @@ import {
   FileText, FileImage, FileVideo, FileAudio, FileCode, FileArchive,
   FileSpreadsheet, FileJson, FileQuestion,
 } from "lucide-react";
+import { toast, confirmDialog as showConfirmDialog, promptDialog } from "../lib/ui";
 
 interface FileEntry {
   name: string;
@@ -30,13 +31,15 @@ export interface TransferTaskItem {
   speed: number;
   status: "pending" | "transferring" | "completed" | "failed" | "paused";
   error?: string;
+  deviceId?: string;
+  deviceName?: string;
 }
 
 type OverwriteStrategy = "skip" | "overwrite" | "rename";
 
 interface ConfirmDialogState {
   mode: "upload" | "download";
-  files: File[] | FileEntry[];
+  files: (File | FileEntry)[];
   targetPath: string;
   overwriteStrategy: OverwriteStrategy;
 }
@@ -83,11 +86,11 @@ const formatETA = (seconds: number): string => {
 
 const getProgressColor = (status: TransferTaskItem["status"]): string => {
   switch (status) {
-    case "transferring": return "bg-blue-500";
-    case "completed": return "bg-emerald-500";
-    case "failed": return "bg-red-500";
-    case "paused": return "bg-amber-500";
-    default: return "bg-slate-300";
+    case "transferring": return "bg-primary";
+    case "completed": return "bg-success";
+    case "failed": return "bg-error";
+    case "paused": return "bg-warning";
+    default: return "bg-muted-foreground";
   }
 };
 
@@ -123,15 +126,15 @@ const getFileType = (entry: FileEntry): string => {
 };
 
 const getFileIcon = (entry: FileEntry): { Icon: React.ComponentType<any>; color: string } => {
-  if (entry.type === "disk") return { Icon: HardDrive, color: "text-slate-500" };
+  if (entry.type === "disk") return { Icon: HardDrive, color: "text-muted-foreground" };
   if (entry.is_dir) return { Icon: Folder, color: "text-amber-500" };
   const ext = entry.name.split(".").pop()?.toLowerCase() || "";
 
   const imageExts = ["jpg", "jpeg", "png", "gif", "bmp", "webp", "svg", "ico", "tiff", "tif"];
-  if (imageExts.includes(ext)) return { Icon: FileImage, color: "text-pink-500" };
+  if (imageExts.includes(ext)) return { Icon: FileImage, color: "text-warning" };
 
   const videoExts = ["mp4", "avi", "mkv", "mov", "wmv", "flv", "webm", "m4v", "3gp"];
-  if (videoExts.includes(ext)) return { Icon: FileVideo, color: "text-purple-500" };
+  if (videoExts.includes(ext)) return { Icon: FileVideo, color: "text-primary" };
 
   const audioExts = ["mp3", "wav", "flac", "aac", "ogg", "wma", "m4a", "ape"];
   if (audioExts.includes(ext)) return { Icon: FileAudio, color: "text-emerald-500" };
@@ -150,7 +153,7 @@ const getFileIcon = (entry: FileEntry): { Icon: React.ComponentType<any>; color:
 
   if (ext === "json") return { Icon: FileJson, color: "text-yellow-600" };
 
-  return { Icon: FileQuestion, color: "text-slate-400" };
+  return { Icon: FileQuestion, color: "text-muted-foreground" };
 };
 
 async function traverseEntry(entry: FileSystemEntry, relativePath: string, result: File[]): Promise<void> {
@@ -201,7 +204,7 @@ async function collectDraggedFiles(items: DataTransferItemList): Promise<File[]>
 const Breadcrumb = ({ path, onNavigate }: { path: string; onNavigate: (p: string) => void }) => {
   if (!path) {
     return (
-      <div className="flex items-center gap-2 text-xs text-slate-700">
+      <div className="flex items-center gap-2 text-xs text-muted-foreground">
         <HardDrive className="w-3.5 h-3.5" />
         <span>此电脑</span>
         <ChevronDown className="w-3 h-3" />
@@ -211,20 +214,20 @@ const Breadcrumb = ({ path, onNavigate }: { path: string; onNavigate: (p: string
   const parts = path.split("\\").filter(Boolean);
   return (
     <div className="flex items-center gap-1 overflow-x-auto text-xs">
-      <button onClick={() => onNavigate("")} className="flex items-center gap-1 text-slate-600 hover:text-slate-800 shrink-0 px-1 py-0.5 rounded hover:bg-slate-200">
+      <button onClick={() => onNavigate("")} className="flex items-center gap-1 text-muted-foreground hover:text-foreground shrink-0 px-1 py-0.5 rounded hover:bg-muted">
         <HardDrive className="w-3 h-3" /> 此电脑
       </button>
-      <ChevronDown className="w-3 h-3 text-slate-400 shrink-0" />
+      <ChevronDown className="w-3 h-3 text-muted-foreground shrink-0" />
       {parts.map((part, idx) => {
         const fullPath = parts.slice(0, idx + 1).join("\\") + "\\";
         const isLast = idx === parts.length - 1;
         return (
           <React.Fragment key={idx}>
             <button onClick={() => onNavigate(fullPath)}
-              className={`px-1 py-0.5 rounded shrink-0 ${isLast ? "bg-slate-200 text-slate-800 font-medium" : "text-slate-600 hover:text-slate-800 hover:bg-slate-200"}`}>
+              className={`px-1 py-0.5 rounded shrink-0 ${isLast ? "bg-muted text-foreground font-medium" : "text-muted-foreground hover:text-foreground hover:bg-muted"}`}>
               {part}
             </button>
-            {!isLast && <ChevronDown className="w-3 h-3 text-slate-400 shrink-0 -rotate-90" />}
+            {!isLast && <ChevronDown className="w-3 h-3 text-muted-foreground shrink-0 -rotate-90" />}
           </React.Fragment>
         );
       })}
@@ -251,8 +254,8 @@ const FilePane: React.FC<FilePaneProps> = ({
   return (
     <div ref={scrollRef} className="flex-1 overflow-y-auto">
       <table className="w-full text-xs">
-        <thead className="sticky top-0 bg-slate-100 border-b border-slate-200 z-10">
-          <tr className="text-slate-500">
+        <thead className="sticky top-0 bg-card border-b border-border z-10">
+          <tr className="text-muted-foreground">
             <th className="w-8 py-1.5 px-1.5 text-left font-normal">
               <input type="checkbox" className="rounded" readOnly />
             </th>
@@ -267,12 +270,12 @@ const FilePane: React.FC<FilePaneProps> = ({
             <tr>
               <td colSpan={5} className="text-center py-12">
                 {isRemote ? (
-                  <span className="text-slate-400">{remoteLoading ? "加载中..." : "此文件夹为空"}</span>
+                  <span className="text-muted-foreground">{remoteLoading ? "加载中..." : "此文件夹为空"}</span>
                 ) : (
                   <div className="flex flex-col items-center gap-3">
-                    <Upload className="w-10 h-10 text-slate-300" />
-                    <div className="text-slate-400 text-sm">拖拽文件到此窗口，或点击右上角按钮选择文件</div>
-                    <div className="text-slate-300 text-xs">浏览器出于安全限制无法直接访问本地文件系统</div>
+                    <Upload className="w-10 h-10 text-muted-foreground opacity-50" />
+                    <div className="text-muted-foreground text-sm">拖拽文件到此窗口，或点击右上角按钮选择文件</div>
+                    <div className="text-muted-foreground text-xs">浏览器出于安全限制无法直接访问本地文件系统</div>
                   </div>
                 )}
               </td>
@@ -284,7 +287,8 @@ const FilePane: React.FC<FilePaneProps> = ({
               const isDir = entry.is_dir;
               return (
                 <tr key={entry.name}
-                  className={`border-b border-slate-100 cursor-pointer hover:bg-blue-50 ${isSelected ? "bg-blue-100" : ""}`}
+                  className={`border-b border-border cursor-pointer hover:bg-muted`}
+                  style={isSelected ? { background: 'rgba(37,99,235,0.15)' } : undefined}
                   onClick={(e) => {
                     if (isDisk) {
                       if (isRemote && onNavigate) onNavigate(entry.name);
@@ -325,7 +329,7 @@ const FilePane: React.FC<FilePaneProps> = ({
                         ) : entry.disk_type === "cdrom" ? (
                           <Disc className="w-4 h-4 text-amber-500 shrink-0" />
                         ) : (
-                          <HardDrive className="w-4 h-4 text-slate-500 shrink-0" />
+                          <HardDrive className="w-4 h-4 text-muted-foreground shrink-0" />
                         )
                       ) : (
                         (() => {
@@ -337,32 +341,32 @@ const FilePane: React.FC<FilePaneProps> = ({
                         <div className="flex items-center gap-2 min-w-0">
                           {isDisk ? (
                             <>
-                              <span className="truncate text-slate-800 font-medium">
+                              <span className="truncate text-foreground font-medium">
                                 {entry.label || entry.name.replace("\\", "")}
                               </span>
-                              <span className="text-slate-400 text-xs shrink-0">
+                              <span className="text-muted-foreground text-xs shrink-0">
                                 ({entry.name.replace("\\", "")})
                               </span>
                             </>
                           ) : (
-                            <span className="truncate text-slate-800">{entry.name}</span>
+                            <span className="truncate text-foreground">{entry.name}</span>
                           )}
                         </div>
                         {isDisk && entry.size > 0 && (
                           <div className="flex items-center gap-1.5 mt-0.5 min-w-0">
-                            <div className="flex-1 h-1 bg-slate-200 rounded-full overflow-hidden min-w-[60px]">
+                            <div className="flex-1 h-1 bg-muted rounded-full overflow-hidden min-w-[60px]">
                               <div
                                 className={`h-full rounded-full ${
                                   (1 - (entry.free || 0) / entry.size) > 0.9
-                                    ? "bg-red-500"
+                                    ? "bg-error"
                                     : (1 - (entry.free || 0) / entry.size) > 0.75
-                                    ? "bg-amber-500"
-                                    : "bg-emerald-500"
+                                    ? "bg-warning"
+                                    : "bg-success"
                                 }`}
                                 style={{ width: `${Math.round((1 - (entry.free || 0) / entry.size) * 100)}%` }}
                               />
                             </div>
-                            <span className="text-[10px] text-slate-500 shrink-0 font-mono whitespace-nowrap">
+                            <span className="text-[10px] text-muted-foreground shrink-0 font-mono whitespace-nowrap">
                               可用 {fmtSize(entry.free || 0)} / {fmtSize(entry.size)}
                             </span>
                           </div>
@@ -370,9 +374,9 @@ const FilePane: React.FC<FilePaneProps> = ({
                       </div>
                     </div>
                   </td>
-                  <td className="py-1 px-1.5 text-slate-600">{fmtDate(entry.modified)}</td>
-                  <td className="py-1 px-1.5 text-slate-600">{getFileType(entry)}</td>
-                  <td className="py-1 px-1.5 text-slate-600 text-right font-mono">
+                  <td className="py-1 px-1.5 text-muted-foreground">{fmtDate(entry.modified)}</td>
+                  <td className="py-1 px-1.5 text-muted-foreground">{getFileType(entry)}</td>
+                  <td className="py-1 px-1.5 text-muted-foreground text-right font-mono">
                     {isDisk ? (entry.size > 0 ? fmtSize(entry.size) : "--") : isDir ? "--" : fmtSize(entry.size)}
                   </td>
                 </tr>
@@ -437,6 +441,20 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
   const dirPickerTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dirPickerOpenRef = useRef(false);
   useEffect(() => { dirPickerOpenRef.current = dirPickerOpen; }, [dirPickerOpen]);
+  const [dirPickerSelected, setDirPickerSelected] = useState<string | null>(null);
+  const [dirPickerError, setDirPickerError] = useState("");
+  const [dirPickerShowNewFolder, setDirPickerShowNewFolder] = useState(false);
+  const [dirPickerNewFolderName, setDirPickerNewFolderName] = useState("");
+
+  // 目录选择弹窗打开期间支持 Esc 关闭
+  useEffect(() => {
+    if (!dirPickerOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setDirPickerOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [dirPickerOpen]);
 
   const remotePathRef = useRef(remotePath);
   useEffect(() => { remotePathRef.current = remotePath; }, [remotePath]);
@@ -496,6 +514,7 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
       if (dirPickerOpenRef.current) {
         setDirPickerEntries(newEntries);
         setDirPickerLoading(false);
+        setDirPickerError("");
         if (dirPickerTimeoutRef.current) { clearTimeout(dirPickerTimeoutRef.current); dirPickerTimeoutRef.current = null; }
       } else {
         const oldEntries = remoteEntriesRef.current;
@@ -515,6 +534,7 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
       if (dirPickerOpenRef.current) {
         setDirPickerEntries([]);
         setDirPickerLoading(false);
+        setDirPickerError(msg.error || "无法读取远程目录");
         if (dirPickerTimeoutRef.current) { clearTimeout(dirPickerTimeoutRef.current); dirPickerTimeoutRef.current = null; }
       } else {
         setRemoteEntries([]);
@@ -582,12 +602,15 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
   const loadDirPicker = useCallback(async (path: string) => {
     if (!clientRef.current?.ws || clientRef.current.ws.readyState !== 1) return;
     setDirPickerLoading(true);
+    setDirPickerError("");
     setDirPickerPath(path);
+    setDirPickerSelected(path);
     const msg = JSON.stringify({ action: "list_dir", path });
     clientRef.current.ws.send(msg);
     if (dirPickerTimeoutRef.current) clearTimeout(dirPickerTimeoutRef.current);
     dirPickerTimeoutRef.current = setTimeout(() => {
       setDirPickerLoading(false);
+      setDirPickerError("加载远程目录超时，请稍后重试");
     }, 30000);
   }, [clientRef]);
 
@@ -600,6 +623,17 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
       const parent = parts.slice(0, -1).join("\\") + "\\";
       loadDirPicker(parent);
     }
+  };
+
+  const handleDirPickerCreateFolder = () => {
+    const name = dirPickerNewFolderName.trim();
+    if (!name || !clientRef.current?.ws) return;
+    const fullPath = dirPickerPath ? `${dirPickerPath}\\${name}` : name;
+    clientRef.current.ws.send(JSON.stringify({ action: "create_dir", path: fullPath }));
+    setDirPickerNewFolderName("");
+    setDirPickerShowNewFolder(false);
+    // 立即刷新：list_dir_result 到达后自然更新；失败由 30s 超时兜底提示
+    loadDirPicker(dirPickerPath);
   };
 
   const handleRemoteUp = () => {
@@ -615,8 +649,8 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
 
   const handleRemoteBack = handleRemoteUp;
 
-  const handleCreateRemoteFolder = () => {
-    const name = window.prompt("请输入文件夹名称：");
+  const handleCreateRemoteFolder = async () => {
+    const name = await promptDialog("请输入文件夹名称：");
     if (!name || !clientRef.current?.ws) return;
     const fullPath = remotePath ? `${remotePath}\\${name}` : name;
     clientRef.current.ws.send(JSON.stringify({ action: "create_dir", path: fullPath }));
@@ -626,12 +660,12 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
   const handleDeleteRemote = async (name: string) => {
     if (!clientRef.current?.ws) return;
     const fullPath = remotePath ? `${remotePath}\\${name}` : name;
-    if (!window.confirm(`确认删除 ${name}?`)) return;
+    if (!(await showConfirmDialog(`确认删除 ${name}?`, { danger: true }))) return;
     clientRef.current.ws.send(JSON.stringify({ action: "delete_file", path: fullPath }));
   };
 
-  const handleRenameRemote = (oldName: string) => {
-    const newName = window.prompt("请输入新名称：", oldName);
+  const handleRenameRemote = async (oldName: string) => {
+    const newName = await promptDialog("请输入新名称：", oldName);
     if (!newName || !clientRef.current?.ws || newName === oldName) return;
     clientRef.current.ws.send(JSON.stringify({ action: "rename", path: remotePath, oldname: oldName, newname: newName }));
     setTimeout(() => loadRemoteDir(remotePath), 500);
@@ -660,12 +694,32 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
   };
 
   const startUpload = async (files: File[], targetPath: string, overwrite: OverwriteStrategy) => {
+    // 上传前探测远端目标路径：不存在时提示用户确认是否自动创建
+    if (targetPath) {
+      try {
+        const exists = await clientRef.current?.checkDirExists?.(targetPath);
+        if (exists === false) {
+          const shouldCreate = await showConfirmDialog(
+            `远端路径 "${targetPath}" 不存在。\n是否自动创建该目录后继续上传？`
+          );
+          if (!shouldCreate) {
+            toast("已取消上传，请修改远程保存路径后重试。", "info");
+            return;
+          }
+          clientRef.current?.createDir?.(targetPath);
+        }
+      } catch (err) {
+        console.warn("[FileManager] 目录探测失败，继续上传（Agent 兜底创建）:", err);
+      }
+    }
+
     const directories = new Set<string>();
     const filesWithTargets: { file: File; targetDir: string; displayName: string }[] = [];
 
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
-      const relPath = (file as any).webkitRelativePath || (file as any)._relativePath || '';
+      // 统一相对路径分隔符为反斜杠（webkitdirectory 选择/部分拖拽场景返回正斜杠，会破坏 Windows 路径层级）
+      const relPath = (((file as any).webkitRelativePath || (file as any)._relativePath || '') as string).replace(/[\\/]/g, '\\');
       let fileTargetDir = targetPath;
       let displayName = file.name;
 
@@ -832,7 +886,7 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-sm flex items-center justify-center p-4"
+    <div className="fixed inset-0 z-50 bg-background/70 backdrop-blur-sm flex items-center justify-center p-4"
       onDragEnter={(e) => {
         e.preventDefault();
         dragCounterRef.current++;
@@ -870,36 +924,36 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
         }
       }}
     >
-      <div className="bg-white w-full max-w-6xl h-[85vh] rounded-lg shadow-2xl flex flex-col overflow-hidden border border-slate-200 relative">
+      <div className="bg-card w-full max-w-6xl h-[85vh] rounded-lg shadow-2xl flex flex-col overflow-hidden border border-border relative">
         {/* Title bar */}
-        <div className="flex items-center justify-between px-4 py-2 bg-slate-50 border-b border-slate-200">
-          <div className="flex items-center gap-2 text-sm font-medium text-slate-700">
-            <Folder className="w-4 h-4 text-indigo-500" />
+        <div className="flex items-center justify-between px-4 py-2 bg-card border-b border-border">
+          <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+            <Folder className="w-4 h-4 text-primary" />
             <span>文件管理器 — {deviceName}</span>
           </div>
           <div className="flex items-center gap-1">
             {onMinimize && (
-              <button onClick={onMinimize} className="p-1.5 hover:bg-slate-200 rounded text-slate-500 hover:text-slate-700" title="最小化（后台继续传输）">
+              <button onClick={onMinimize} className="p-1.5 hover:bg-muted rounded text-muted-foreground hover:text-foreground" title="最小化（后台继续传输）">
                 <Minus className="w-4 h-4" />
               </button>
             )}
-            <button onClick={onClose} className="p-1.5 hover:bg-slate-200 rounded text-slate-500 hover:text-slate-700" title="关闭">
+            <button onClick={onClose} className="p-1.5 hover:bg-muted rounded text-muted-foreground hover:text-foreground" title="关闭">
               <X className="w-4 h-4" />
             </button>
           </div>
         </div>
 
         {/* Device headers */}
-        <div className="flex items-stretch border-b border-slate-200">
-          <div className="flex-1 flex items-center gap-3 px-4 py-2.5 bg-white">
+        <div className="flex items-stretch border-b border-border">
+          <div className="flex-1 flex items-center gap-3 px-4 py-2.5 bg-card">
             <div className="flex items-center gap-2">
-              <h3 className="text-lg font-bold text-slate-800">待上传文件</h3>
+              <h3 className="text-lg font-bold text-foreground">待上传文件</h3>
             </div>
           </div>
-          <div className="flex-1 flex items-center justify-end gap-3 px-4 py-2.5 bg-white">
+          <div className="flex-1 flex items-center justify-end gap-3 px-4 py-2.5 bg-card">
             <div className="flex items-center gap-2">
-              <span className="text-[10px] px-2 py-0.5 bg-emerald-100 text-emerald-700 rounded-full font-medium">远端</span>
-              <h3 className="text-lg font-bold text-slate-800">{deviceName || "远程设备"}</h3>
+              <span className="text-[10px] px-2 py-0.5 rounded-full font-medium" style={{ background: 'rgba(16,185,129,0.12)', color: 'var(--ur-state-success)' }}>远端</span>
+              <h3 className="text-lg font-bold text-foreground">{deviceName || "远程设备"}</h3>
             </div>
           </div>
         </div>
@@ -907,9 +961,9 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
         {/* Main content: dual panes */}
         <div className="flex-1 flex min-h-0">
           {/* Left: Pending Uploads */}
-          <div className="flex-1 flex flex-col border-r border-slate-200 min-w-0">
+          <div className="flex-1 flex flex-col border-r border-border min-w-0">
             {/* Toolbar */}
-            <div className="flex items-center gap-1 px-2 py-1.5 bg-white border-b border-slate-200">
+            <div className="flex items-center gap-1 px-2 py-1.5 bg-card border-b border-border">
               <div className="flex-1" />
               <input ref={fileInputRef} type="file" multiple className="hidden"
                 onChange={(e) => { if (e.target.files) handleFileSelect(e.target.files); }} />
@@ -917,12 +971,16 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
                 {...{ webkitdirectory: "", directory: "" } as any}
                 onChange={(e) => { if (e.target.files) handleFileSelect(e.target.files); }} />
               <button onClick={() => fileInputRef.current?.click()}
-                className="p-1.5 hover:bg-slate-100 rounded text-slate-500" title="选择文件">
+                className="p-1.5 hover:bg-muted rounded text-muted-foreground" title="选择文件">
                 <Upload className="w-4 h-4" />
+              </button>
+              <button onClick={() => folderInputRef.current?.click()}
+                className="p-1.5 hover:bg-muted rounded text-muted-foreground" title="选择文件夹（保留目录层级）">
+                <FolderPlus className="w-4 h-4" />
               </button>
               {pendingUploads.length > 0 && (
                 <button onClick={() => { setPendingUploads([]); pendingUploadFilesRef.current = []; }}
-                  className="p-1.5 hover:bg-slate-100 rounded text-slate-500" title="清空列表">
+                  className="p-1.5 hover:bg-muted rounded text-muted-foreground" title="清空列表">
                   <Trash2 className="w-4 h-4" />
                 </button>
               )}
@@ -931,17 +989,21 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
             <div className="flex-1 overflow-y-auto">
               {pendingUploads.length === 0 ? (
                 <div className="h-full flex flex-col items-center justify-center gap-3 px-4">
-                  <Upload className="w-12 h-12 text-slate-300" />
-                  <div className="text-slate-500 text-sm text-center">拖拽文件到此窗口，或点击上方按钮选择文件</div>
-                  <div className="text-slate-300 text-xs text-center">浏览器出于安全限制无法直接访问本地文件系统</div>
+                  <Upload className="w-12 h-12 text-muted-foreground opacity-50" />
+                  <div className="text-muted-foreground text-sm text-center">拖拽文件到此窗口，或点击上方按钮选择文件</div>
+                  <div className="text-muted-foreground text-xs text-center">浏览器出于安全限制无法直接访问本地文件系统</div>
                 </div>
               ) : (
                 <div className="flex flex-col">
-                  {pendingUploads.map((file, idx) => (
-                    <div key={idx} className="flex items-center gap-2 px-3 py-2 border-b border-slate-100 hover:bg-slate-50">
-                      <File className="w-4 h-4 text-slate-400 shrink-0" />
-                      <span className="flex-1 truncate text-sm text-slate-700 min-w-0">{file.name}</span>
-                      <span className="text-xs text-slate-400 shrink-0 font-mono">{fmtSize(file.size)}</span>
+                  {pendingUploads.map((file, idx) => {
+                    const relDir = (((file as any)._relativePath || '') as string).replace(/[\\/]/g, '\\');
+                    const webRel = (((file as any).webkitRelativePath || '') as string).replace(/[\\/]/g, '\\');
+                    const shownName = relDir ? `${relDir}\\${file.name}` : (webRel || file.name);
+                    return (
+                    <div key={idx} className="flex items-center gap-2 px-3 py-2 border-b border-border hover:bg-muted">
+                      <File className="w-4 h-4 text-muted-foreground shrink-0" />
+                      <span className="flex-1 truncate text-sm text-foreground min-w-0" title={shownName}>{shownName}</span>
+                      <span className="text-xs text-muted-foreground shrink-0 font-mono">{fmtSize(file.size)}</span>
                       <button
                         onClick={() => {
                           setPendingUploads(prev => {
@@ -950,12 +1012,13 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
                             return next;
                           });
                         }}
-                        className="p-1 hover:bg-slate-200 rounded text-slate-400 hover:text-red-500 shrink-0"
+                        className="p-1 hover:bg-muted rounded text-muted-foreground hover:text-error shrink-0"
                         title="移除">
                         <X className="w-3.5 h-3.5" />
                       </button>
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
             </div>
@@ -964,28 +1027,28 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
           {/* Right: Remote */}
           <div className="flex-1 flex flex-col min-w-0">
             {/* Toolbar */}
-            <div className="flex items-center gap-1 px-2 py-1.5 bg-white border-b border-slate-200">
-              <button onClick={handleRemoteBack} className="p-1.5 hover:bg-slate-100 rounded text-slate-500" title="后退">
+            <div className="flex items-center gap-1 px-2 py-1.5 bg-card border-b border-border">
+              <button onClick={handleRemoteBack} className="p-1.5 hover:bg-muted rounded text-muted-foreground" title="后退">
                 <ArrowLeft className="w-4 h-4" />
               </button>
-              <button onClick={handleRemoteUp} className="p-1.5 hover:bg-slate-100 rounded text-slate-500" title="向上">
+              <button onClick={handleRemoteUp} className="p-1.5 hover:bg-muted rounded text-muted-foreground" title="向上">
                 <ChevronUp className="w-4 h-4" />
               </button>
-              <button onClick={() => loadRemoteDir(remotePath)} className="p-1.5 hover:bg-slate-100 rounded text-slate-500" title="刷新">
+              <button onClick={() => loadRemoteDir(remotePath)} className="p-1.5 hover:bg-muted rounded text-muted-foreground" title="刷新">
                 <RefreshCw className={`w-4 h-4 ${remoteLoading ? "animate-spin" : ""}`} />
               </button>
-              <div className="w-px h-4 bg-slate-200 mx-1"></div>
-              <div className="flex-1 flex items-center gap-1 px-2 py-1 bg-slate-100 rounded min-w-0">
+              <div className="w-px h-4 bg-border mx-1"></div>
+              <div className="flex-1 flex items-center gap-1 px-2 py-1 bg-muted rounded min-w-0">
                 <Breadcrumb path={remotePath} onNavigate={loadRemoteDir} />
               </div>
-              <div className="w-px h-4 bg-slate-200 mx-1"></div>
+              <div className="w-px h-4 bg-border mx-1"></div>
               <button onClick={handleDownloadSelected}
                 disabled={selectedRemote.size === 0}
-                className="p-1.5 hover:bg-slate-100 rounded text-slate-500 disabled:opacity-40 disabled:cursor-not-allowed" title="下载选中文件">
+                className="p-1.5 hover:bg-muted rounded text-muted-foreground disabled:opacity-40 disabled:cursor-not-allowed" title="下载选中文件">
                 <Download className="w-4 h-4" />
               </button>
               <button onClick={handleCreateRemoteFolder}
-                className="p-1.5 hover:bg-slate-100 rounded text-slate-500" title="新建文件夹">
+                className="p-1.5 hover:bg-muted rounded text-muted-foreground" title="新建文件夹">
                 <FolderPlus className="w-4 h-4" />
               </button>
               <button
@@ -996,7 +1059,7 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
                   }
                 }}
                 disabled={selectedRemote.size !== 1}
-                className="p-1.5 hover:bg-slate-100 rounded text-slate-500 disabled:opacity-40 disabled:cursor-not-allowed" title="重命名">
+                className="p-1.5 hover:bg-muted rounded text-muted-foreground disabled:opacity-40 disabled:cursor-not-allowed" title="重命名">
                 <Pencil className="w-4 h-4" />
               </button>
               <button
@@ -1004,7 +1067,7 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
                   for (const name of selectedRemote) handleDeleteRemote(name);
                 }}
                 disabled={selectedRemote.size === 0}
-                className="p-1.5 hover:bg-slate-100 rounded text-slate-500 disabled:opacity-40 disabled:cursor-not-allowed" title="删除">
+                className="p-1.5 hover:bg-muted rounded text-muted-foreground disabled:opacity-40 disabled:cursor-not-allowed" title="删除">
                 <Trash2 className="w-4 h-4" />
               </button>
             </div>
@@ -1027,41 +1090,41 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
         </div>
 
         {/* Transfer list */}
-        <div className="border-t border-slate-200 bg-slate-50 flex flex-col" style={{ height: "180px" }}>
-          <div className="flex items-center justify-between px-4 py-2 border-b border-slate-200 bg-white gap-3">
+        <div className="border-t border-border bg-card flex flex-col" style={{ height: "180px" }}>
+          <div className="flex items-center justify-between px-4 py-2 border-b border-border bg-card gap-3">
             <div className="flex items-center gap-3 flex-1 min-w-0">
-              <span className="text-xs font-medium text-slate-600 shrink-0">传输列表</span>
+              <span className="text-xs font-medium text-muted-foreground shrink-0">传输列表</span>
               {transferTasks.length > 0 && (
                 <>
-                  <div className="flex-1 h-1.5 bg-slate-200 rounded-full overflow-hidden max-w-xs">
-                    <div className="h-full bg-gradient-to-r from-indigo-500 to-indigo-400 rounded-full transition-all"
-                      style={{ width: `${totalProgress.percent}%` }} />
+                  <div className="flex-1 h-1.5 bg-muted rounded-full overflow-hidden max-w-xs">
+                    <div className="h-full rounded-full transition-all"
+                      style={{ width: `${totalProgress.percent}%`, background: 'var(--ur-primary-600)' }} />
                   </div>
-                  <span className="text-[11px] text-indigo-600 font-mono font-bold shrink-0">
+                  <span className="text-[11px] text-primary font-mono font-bold shrink-0">
                     {totalProgress.percent}% · {totalProgress.doneStr} / {totalProgress.totalStr}
                   </span>
                 </>
               )}
             </div>
             <div className="flex items-center gap-1 shrink-0">
-              <button onClick={handlePauseAll} className="flex items-center gap-1 px-2 py-1 text-xs text-slate-600 hover:bg-slate-100 rounded">
+              <button onClick={handlePauseAll} className="flex items-center gap-1 px-2 py-1 text-xs text-muted-foreground hover:bg-muted rounded">
                 <Pause className="w-3 h-3" /> 全部暂停
               </button>
-              <button onClick={handleStartAll} className="flex items-center gap-1 px-2 py-1 text-xs text-slate-600 hover:bg-slate-100 rounded">
+              <button onClick={handleStartAll} className="flex items-center gap-1 px-2 py-1 text-xs text-muted-foreground hover:bg-muted rounded">
                 <Play className="w-3 h-3" /> 全部开始
               </button>
-              <button onClick={handleCancelAll} className="flex items-center gap-1 px-2 py-1 text-xs text-slate-600 hover:bg-slate-100 rounded">
+              <button onClick={handleCancelAll} className="flex items-center gap-1 px-2 py-1 text-xs text-muted-foreground hover:bg-muted rounded">
                 <Ban className="w-3 h-3" /> 全部取消
               </button>
-              <button onClick={handleClearCompleted} className="flex items-center gap-1 px-2 py-1 text-xs text-slate-600 hover:bg-slate-100 rounded">
+              <button onClick={handleClearCompleted} className="flex items-center gap-1 px-2 py-1 text-xs text-muted-foreground hover:bg-muted rounded">
                 <Eraser className="w-3 h-3" /> 清除完结任务
               </button>
             </div>
           </div>
           <div className="flex-1 overflow-y-auto">
             <table className="w-full text-xs">
-              <thead className="sticky top-0 bg-slate-100 border-b border-slate-200">
-                <tr className="text-slate-500">
+              <thead className="sticky top-0 bg-card border-b border-border">
+                <tr className="text-muted-foreground">
                   <th className="py-1.5 px-3 text-left font-normal">名称</th>
                   <th className="py-1.5 px-3 text-left font-normal w-20">状态</th>
                   <th className="py-1.5 px-3 text-right font-normal w-24">大小</th>
@@ -1073,7 +1136,7 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
               <tbody>
                 {transferTasks.length === 0 ? (
                   <tr>
-                    <td colSpan={6} className="text-center py-6 text-slate-400">暂无传输任务</td>
+                    <td colSpan={6} className="text-center py-6 text-muted-foreground">暂无传输任务</td>
                   </tr>
                 ) : (
                   transferTasks.map(task => {
@@ -1088,26 +1151,27 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
                       const remainingSeconds = remainingBytes / (task.speed * 1024 * 1024);
                       eta = formatETA(remainingSeconds);
                     }
-                    let rowFlashClass = "";
+                    let rowFlashStyle: React.CSSProperties = {};
                     if (isFlashing) {
-                      if (task.status === "completed") rowFlashClass = "bg-emerald-50";
-                      else if (task.status === "failed") rowFlashClass = "bg-red-50";
+                      if (task.status === "completed") rowFlashStyle = { background: 'rgba(16,185,129,0.08)' };
+                      else if (task.status === "failed") rowFlashStyle = { background: 'rgba(239,68,68,0.08)' };
                     }
                     return (
-                      <tr key={task.id} className={`border-b border-slate-100 hover:bg-slate-50 transition-colors duration-500 ${rowFlashClass}`}>
+                      <tr key={task.id} className={`border-b border-border hover:bg-muted transition-colors duration-500`}
+                        style={rowFlashStyle}>
                         <td className="py-1.5 px-3">
                           <div className="flex items-center gap-2 min-w-0">
                             {task.direction === "upload" ? (
-                              <Upload className="w-3.5 h-3.5 text-blue-500 shrink-0" />
+                              <Upload className="w-3.5 h-3.5 text-primary shrink-0" />
                             ) : (
-                              <Download className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
+                              <Download className="w-3.5 h-3.5 text-success shrink-0" />
                             )}
-                            <span className="truncate text-slate-700">{task.name}</span>
+                            <span className="truncate text-foreground">{task.name}</span>
                             {showProgressInName && (
-                              <span className="text-[10px] text-slate-500 font-mono shrink-0">{task.progress}%</span>
+                              <span className="text-[10px] text-muted-foreground font-mono shrink-0">{task.progress}%</span>
                             )}
                             {showProgressBar && (
-                              <div className="w-20 h-2 bg-slate-200 rounded-full overflow-hidden shrink-0">
+                              <div className="w-20 h-2 bg-muted rounded-full overflow-hidden shrink-0">
                                 <div className={`h-full rounded-full ${getProgressColor(task.status)}`} style={{ width: `${task.progress}%` }} />
                               </div>
                             )}
@@ -1116,37 +1180,37 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
                         <td className="py-1.5 px-3">
                           <div className="flex flex-col gap-0.5">
                             <div>
-                              {task.status === "completed" && <span className="text-emerald-600">完成</span>}
-                              {task.status === "transferring" && <span className="text-blue-600">传输中</span>}
-                              {task.status === "failed" && <span className="text-red-500" title={task.error}>失败</span>}
-                              {task.status === "paused" && <span className="text-amber-600">已暂停</span>}
-                              {task.status === "pending" && <span className="text-slate-500">等待中</span>}
+                              {task.status === "completed" && <span className="text-success">完成</span>}
+                              {task.status === "transferring" && <span className="text-primary">传输中</span>}
+                              {task.status === "failed" && <span className="text-error" title={task.error}>失败</span>}
+                              {task.status === "paused" && <span className="text-warning">已暂停</span>}
+                              {task.status === "pending" && <span className="text-muted-foreground">等待中</span>}
                             </div>
                             {(showSpeed || showETA) && (
-                              <div className="flex gap-2 text-[10px] font-mono text-slate-500">
+                              <div className="flex gap-2 text-[10px] font-mono text-muted-foreground">
                                 {showSpeed && <span>{task.speed.toFixed(2)} MB/s</span>}
                                 {showETA && <span>· {eta}</span>}
                               </div>
                             )}
                           </div>
                         </td>
-                        <td className="py-1.5 px-3 text-right font-mono text-slate-600">{fmtSize(task.size)}</td>
-                        <td className="py-1.5 px-3 text-slate-600 truncate font-mono" title={task.sourcePath}>{task.sourcePath}</td>
-                        <td className="py-1.5 px-3 text-slate-600 truncate font-mono" title={task.targetPath}>{task.targetPath}</td>
+                        <td className="py-1.5 px-3 text-right font-mono text-muted-foreground">{fmtSize(task.size)}</td>
+                        <td className="py-1.5 px-3 text-muted-foreground truncate font-mono" title={task.sourcePath}>{task.sourcePath}</td>
+                        <td className="py-1.5 px-3 text-muted-foreground truncate font-mono" title={task.targetPath}>{task.targetPath}</td>
                         <td className="py-1.5 px-3">
                           <div className="flex items-center justify-center gap-0.5">
                             {task.status === "transferring" && (
-                              <button onClick={() => handlePauseTask(task.id)} className="p-1 hover:bg-slate-200 rounded text-slate-500 hover:text-slate-700" title="暂停">
+                              <button onClick={() => handlePauseTask(task.id)} className="p-1 hover:bg-muted rounded text-muted-foreground hover:text-foreground" title="暂停">
                                 <Pause className="w-3.5 h-3.5" />
                               </button>
                             )}
                             {(task.status === "paused" || task.status === "failed") && (
-                              <button onClick={() => handleResumeTask(task.id)} className="p-1 hover:bg-slate-200 rounded text-slate-500 hover:text-slate-700" title="继续">
+                              <button onClick={() => handleResumeTask(task.id)} className="p-1 hover:bg-muted rounded text-muted-foreground hover:text-foreground" title="继续">
                                 <Play className="w-3.5 h-3.5" />
                               </button>
                             )}
                             {(task.status === "transferring" || task.status === "pending" || task.status === "paused") && (
-                              <button onClick={() => handleCancelTask(task.id)} className="p-1 hover:bg-slate-200 rounded text-slate-500 hover:text-red-600" title="取消">
+                              <button onClick={() => handleCancelTask(task.id)} className="p-1 hover:bg-muted rounded text-muted-foreground hover:text-error" title="取消">
                                 <Ban className="w-3.5 h-3.5" />
                               </button>
                             )}
@@ -1162,7 +1226,7 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
         </div>
         {contextMenu && (
           <div
-            className="fixed z-50 bg-white border border-slate-200 rounded-lg shadow-lg py-1 min-w-[140px]"
+            className="fixed z-50 bg-popover border border-border rounded-lg shadow-lg py-1 min-w-[140px]"
             style={{ left: contextMenu.x, top: contextMenu.y }}
             onClick={(e) => e.stopPropagation()}
           >
@@ -1173,7 +1237,7 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
                   setContextMenu(null);
                   setTimeout(handleDownloadSelected, 0);
                 }}
-                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-100 text-left">
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-foreground hover:bg-muted text-left">
                 <Download className="w-3.5 h-3.5" /> 下载
               </button>
             )}
@@ -1182,7 +1246,7 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
                 handleRenameRemote(contextMenu.targetName);
                 setContextMenu(null);
               }}
-              className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-100 text-left">
+              className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-foreground hover:bg-muted text-left">
               <Pencil className="w-3.5 h-3.5" /> 重命名
             </button>
             <button
@@ -1190,45 +1254,46 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
                 handleDeleteRemote(contextMenu.targetName);
                 setContextMenu(null);
               }}
-              className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-red-600 hover:bg-red-50 text-left">
+              className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-error hover:bg-muted text-left">
               <Trash2 className="w-3.5 h-3.5" /> 删除
             </button>
           </div>
         )}
         {confirmDialog && (
-          <div className="fixed inset-0 z-[60] bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4"
+          <div className="fixed inset-0 z-[60] backdrop-blur-sm flex items-center justify-center p-4"
+            style={{ background: 'rgba(10,14,26,0.7)' }}
             onClick={(e) => { if (e.target === e.currentTarget) setConfirmDialog(null); }}>
-            <div className="bg-white w-full max-w-lg rounded-lg shadow-2xl flex flex-col overflow-hidden border border-slate-200">
-              <div className="flex items-center justify-between px-4 py-3 bg-slate-50 border-b border-slate-200">
-                <div className="flex items-center gap-2 text-sm font-medium text-slate-700">
+            <div className="bg-card w-full max-w-lg rounded-lg shadow-2xl flex flex-col overflow-hidden border border-border">
+              <div className="flex items-center justify-between px-4 py-3 bg-card border-b border-border">
+                <div className="flex items-center gap-2 text-sm font-medium text-foreground">
                   {confirmDialog.mode === "upload" ? (
-                    <><Upload className="w-4 h-4 text-blue-500" /> 确认上传</>
+                    <><Upload className="w-4 h-4 text-primary" /> 确认上传</>
                   ) : (
-                    <><Download className="w-4 h-4 text-emerald-500" /> 确认下载</>
+                    <><Download className="w-4 h-4 text-success" /> 确认下载</>
                   )}
                 </div>
-                <button onClick={() => setConfirmDialog(null)} className="p-1 hover:bg-slate-200 rounded text-slate-500 hover:text-slate-700">
+                <button onClick={() => setConfirmDialog(null)} className="p-1 hover:bg-muted rounded text-muted-foreground hover:text-foreground">
                   <X className="w-4 h-4" />
                 </button>
               </div>
               <div className="p-4 space-y-4 max-h-[60vh] overflow-y-auto">
                 <div>
-                  <div className="text-xs text-slate-500 mb-2">
+                  <div className="text-xs text-muted-foreground mb-2">
                     共 {confirmDialog.files.length} 个{confirmDialog.mode === "upload" ? "文件" : "项"}，
                     总大小 {fmtSize(confirmDialog.files.reduce((sum: number, f: any) => sum + (f.size || 0), 0))}
                   </div>
-                  <div className="border border-slate-200 rounded-md max-h-40 overflow-y-auto bg-slate-50">
+                  <div className="border border-border rounded-md max-h-40 overflow-y-auto bg-muted">
                     {confirmDialog.files.map((f: any, i: number) => (
-                      <div key={i} className="flex items-center justify-between px-3 py-1.5 border-b border-slate-100 last:border-b-0 text-xs">
+                      <div key={i} className="flex items-center justify-between px-3 py-1.5 border-b border-border last:border-b-0 text-xs">
                         <div className="flex items-center gap-2 min-w-0">
-                          {f.is_dir ? <Folder className="w-3.5 h-3.5 text-amber-500 shrink-0" /> : <File className="w-3.5 h-3.5 text-slate-400 shrink-0" />}
-                          <span className="truncate text-slate-700">{f.name}</span>
+                          {f.is_dir ? <Folder className="w-3.5 h-3.5 text-amber-500 shrink-0" /> : <File className="w-3.5 h-3.5 text-muted-foreground shrink-0" />}
+                          <span className="truncate text-foreground">{f.name}</span>
                         </div>
                         <div className="flex items-center gap-2 shrink-0 ml-2">
-                          <span className="text-slate-500">{f.size !== undefined ? fmtSize(f.size) : "--"}</span>
+                          <span className="text-muted-foreground">{f.size !== undefined ? fmtSize(f.size) : "--"}</span>
                           <button
                             onClick={(e) => { e.stopPropagation(); handleRemoveConfirmFile(i); }}
-                            className="p-0.5 hover:bg-slate-200 rounded text-slate-400 hover:text-slate-600"
+                            className="p-0.5 hover:bg-muted rounded text-muted-foreground hover:text-foreground"
                             title="移除">
                             <X className="w-3.5 h-3.5" />
                           </button>
@@ -1240,11 +1305,11 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
                 {confirmDialog.mode === "upload" ? (
                   <>
                     <div>
-                      <label className="block text-sm font-medium text-slate-700 mb-1.5">目标位置</label>
+                      <label className="block text-sm font-medium text-foreground mb-1.5">目标位置</label>
                       <div className="flex gap-2">
                         <input type="text" value={confirmTargetInput}
                           onChange={(e) => setConfirmTargetInput(e.target.value)}
-                          className="flex-1 px-3 py-2.5 text-sm font-mono text-slate-800 border-2 border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/30 focus:border-blue-500 bg-slate-50"
+                          className="flex-1 px-3 py-2.5 text-sm font-mono text-foreground border-2 border-border rounded-md focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary bg-muted"
                           placeholder="例如：D:\Downloads" />
                         <button
                           onClick={() => {
@@ -1252,13 +1317,13 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
                             loadDirPicker(confirmTargetInput || "");
                             setDirPickerOpen(true);
                           }}
-                          className="px-4 py-2.5 text-sm bg-white hover:bg-slate-50 text-slate-700 border-2 border-slate-300 hover:border-slate-400 rounded-md font-medium transition-colors whitespace-nowrap shadow-sm">
+                          className="px-4 py-2.5 text-sm bg-card hover:bg-muted text-foreground border-2 border-border hover:border-muted-foreground rounded-md font-medium transition-colors whitespace-nowrap shadow-sm">
                           浏览...
                         </button>
                       </div>
                     </div>
                     <div>
-                      <label className="block text-sm font-medium text-slate-700 mb-1.5">同名文件处理</label>
+                      <label className="block text-sm font-medium text-foreground mb-1.5">同名文件处理</label>
                       <div className="flex gap-3">
                         {[
                           { val: "skip" as OverwriteStrategy, label: "跳过" },
@@ -1269,8 +1334,8 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
                             onClick={() => setConfirmOverwrite(opt.val)}
                             className={`flex-1 px-3 py-2 text-sm rounded-md border-2 font-medium transition-colors ${
                               confirmOverwrite === opt.val
-                                ? "bg-blue-500 text-white border-blue-500 shadow-sm"
-                                : "bg-white text-slate-700 border-slate-300 hover:border-slate-400"
+                                ? "bg-primary text-white border-primary shadow-sm"
+                                : "bg-card text-foreground border-border hover:border-muted-foreground"
                             }`}>
                             {opt.label}
                           </button>
@@ -1279,19 +1344,19 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
                     </div>
                   </>
                 ) : (
-                  <div className="bg-amber-50 border border-amber-200 rounded-md px-3 py-2.5">
+                  <div className="border border-warning/20 rounded-md px-3 py-2.5" style={{ background: 'rgba(245,158,11,0.08)' }}>
                     <div className="flex items-start gap-2">
-                      <Monitor className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-                      <div className="text-xs text-amber-800">
+                      <Monitor className="w-4 h-4 text-warning shrink-0 mt-0.5" />
+                      <div className="text-xs text-warning">
                         文件将下载到浏览器的默认下载目录。您可以在浏览器设置中修改下载位置。
                       </div>
                     </div>
                   </div>
                 )}
               </div>
-              <div className="flex items-center justify-end gap-2 px-4 py-3 bg-slate-50 border-t border-slate-200">
+              <div className="flex items-center justify-end gap-2 px-4 py-3 bg-card border-t border-border">
                 <button onClick={() => setConfirmDialog(null)}
-                  className="px-4 py-1.5 text-xs text-slate-600 hover:bg-slate-200 rounded-md transition-colors">
+                  className="px-4 py-1.5 text-xs text-muted-foreground hover:bg-muted rounded-md transition-colors">
                   取消
                 </button>
                 <button onClick={() => {
@@ -1305,7 +1370,7 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
                   setConfirmDialog(null);
                 }}
                   className={`px-4 py-1.5 text-xs text-white rounded-md transition-colors ${
-                    confirmDialog.mode === "upload" ? "bg-blue-500 hover:bg-blue-600" : "bg-emerald-500 hover:bg-emerald-600"
+                    confirmDialog.mode === "upload" ? "bg-primary hover:opacity-90" : "bg-success hover:opacity-90"
                   }`}>
                   确认{confirmDialog.mode === "upload" ? "上传" : "下载"}
                 </button>
@@ -1314,89 +1379,118 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
           </div>
         )}
         {dirPickerOpen && (
-          <div className="fixed inset-0 z-[70] bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4"
+          <div className="fixed inset-0 z-[70] backdrop-blur-sm flex items-center justify-center p-4"
+            style={{ background: 'rgba(10,14,26,0.7)' }}
             onClick={(e) => { if (e.target === e.currentTarget) setDirPickerOpen(false); }}>
-            <div className="bg-white w-full max-w-2xl rounded-lg shadow-2xl flex flex-col overflow-hidden border border-slate-200">
-              <div className="flex items-center justify-between px-4 py-3 bg-slate-50 border-b border-slate-200">
-                <div className="flex items-center gap-2 text-sm font-medium text-slate-700">
-                  <Folder className="w-4 h-4 text-blue-500" />
+            <div className="bg-card w-full max-w-2xl rounded-lg shadow-2xl flex flex-col overflow-hidden border border-border">
+              <div className="flex items-center justify-between px-4 py-3 bg-card border-b border-border">
+                <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+                  <Folder className="w-4 h-4 text-primary" />
                   选择目标文件夹
                 </div>
-                <button onClick={() => setDirPickerOpen(false)} className="p-1 hover:bg-slate-200 rounded text-slate-500 hover:text-slate-700">
+                <button onClick={() => setDirPickerOpen(false)} className="p-1 hover:bg-muted rounded text-muted-foreground hover:text-foreground">
                   <X className="w-4 h-4" />
                 </button>
               </div>
-              <div className="flex items-center gap-1 px-3 py-2 bg-white border-b border-slate-200">
-                <button onClick={handleDirPickerUp} className="p-1.5 hover:bg-slate-100 rounded text-slate-500" title="向上">
+              <div className="flex items-center gap-1 px-3 py-2 bg-card border-b border-border">
+                <button onClick={handleDirPickerUp} className="p-1.5 hover:bg-muted rounded text-muted-foreground" title="向上">
                   <ChevronUp className="w-4 h-4" />
                 </button>
-                <button onClick={() => loadDirPicker("")} className="p-1.5 hover:bg-slate-100 rounded text-slate-500" title="此电脑">
+                <button onClick={() => loadDirPicker("")} className="p-1.5 hover:bg-muted rounded text-muted-foreground" title="此电脑">
                   <HardDrive className="w-4 h-4" />
                 </button>
-                <div className="flex-1 flex items-center gap-1 px-2 py-1 bg-slate-100 rounded min-w-0 ml-1">
+                <div className="flex-1 flex items-center gap-1 px-2 py-1 bg-muted rounded min-w-0 ml-1">
                   <Breadcrumb path={dirPickerPath} onNavigate={loadDirPicker} />
                 </div>
-                <button onClick={() => loadDirPicker(dirPickerPath)} className="p-1.5 hover:bg-slate-100 rounded text-slate-500" title="刷新">
+                <button
+                  onClick={() => setDirPickerShowNewFolder(v => !v)}
+                  className="p-1.5 hover:bg-muted rounded text-muted-foreground" title="新建文件夹">
+                  <FolderPlus className="w-4 h-4" />
+                </button>
+                <button onClick={() => loadDirPicker(dirPickerPath)} className="p-1.5 hover:bg-muted rounded text-muted-foreground" title="刷新">
                   <RefreshCw className={`w-4 h-4 ${dirPickerLoading ? "animate-spin" : ""}`} />
                 </button>
               </div>
+              {dirPickerShowNewFolder && (
+                <div className="flex items-center gap-2 px-3 py-2 bg-card border-b border-border">
+                  <input
+                    autoFocus
+                    type="text"
+                    value={dirPickerNewFolderName}
+                    onChange={(e) => setDirPickerNewFolderName(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter") handleDirPickerCreateFolder(); }}
+                    placeholder="新文件夹名称（将创建于当前目录）"
+                    className="flex-1 px-2 py-1.5 text-sm bg-muted border border-border rounded-md focus:outline-none focus:ring-2 focus:ring-primary/30"
+                  />
+                  <button onClick={handleDirPickerCreateFolder}
+                    className="px-3 py-1.5 text-sm text-white bg-primary hover:opacity-90 rounded-md transition-colors">
+                    创建
+                  </button>
+                </div>
+              )}
+              {dirPickerError && (
+                <div className="px-4 py-2 text-xs bg-red-50 border-b border-border" style={{ color: '#dc2626' }}>
+                  ⚠ {dirPickerError}
+                </div>
+              )}
               <div className="flex-1 overflow-y-auto" style={{ maxHeight: "50vh" }}>
                 {dirPickerLoading && dirPickerEntries.length === 0 ? (
-                  <div className="text-center py-12 text-slate-400">加载中...</div>
+                  <div className="text-center py-12 text-muted-foreground">加载中...</div>
                 ) : dirPickerEntries.length === 0 ? (
-                  <div className="text-center py-12 text-slate-400">此文件夹为空</div>
+                  <div className="text-center py-12 text-muted-foreground">此文件夹为空</div>
                 ) : (
                   dirPickerEntries
                     .filter(e => e.is_dir || e.type === "disk")
                     .map((entry) => {
                       const isDisk = entry.type === "disk";
+                      const selPath = isDisk ? entry.name : (dirPickerPath ? `${dirPickerPath}\\${entry.name}` : entry.name);
+                      const isSel = dirPickerSelected === selPath;
+                      const enterDir = () => {
+                        if (isDisk) loadDirPicker(entry.name);
+                        else loadDirPicker(dirPickerPath ? `${dirPickerPath}\\${entry.name}` : entry.name);
+                      };
                       return (
                         <div key={entry.name}
-                          className="flex items-center gap-2 px-4 py-2 hover:bg-blue-50 cursor-pointer border-b border-slate-100"
-                          onClick={() => {
-                            if (isDisk) {
-                              loadDirPicker(entry.name);
-                            } else {
-                              loadDirPicker(dirPickerPath ? `${dirPickerPath}\\${entry.name}` : entry.name);
-                            }
-                          }}
-                          onDoubleClick={() => {
-                            const target = isDisk ? entry.name : (dirPickerPath ? `${dirPickerPath}\\${entry.name}` : entry.name);
-                            setConfirmTargetInput(target);
-                            setDirPickerOpen(false);
-                          }}>
+                          className="flex items-center gap-2 px-4 py-2 cursor-pointer border-b border-border select-none"
+                          style={{ background: isSel ? 'rgba(37,99,235,0.08)' : undefined, outline: isSel ? '1px solid rgba(37,99,235,0.5)' : undefined }}
+                          onClick={() => setDirPickerSelected(selPath)}
+                          onDoubleClick={(e) => { e.stopPropagation(); enterDir(); }}
+                          role="button"
+                          tabIndex={0}
+                          onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); enterDir(); } }}
+                          title="单击选中，双击进入">
                           {isDisk ? (
                             entry.disk_type === "removable" ? <Usb className="w-4 h-4 text-emerald-500 shrink-0" /> :
                             entry.disk_type === "network" ? <Network className="w-4 h-4 text-blue-500 shrink-0" /> :
                             entry.disk_type === "cdrom" ? <Disc className="w-4 h-4 text-amber-500 shrink-0" /> :
-                            <HardDrive className="w-4 h-4 text-slate-500 shrink-0" />
+                            <HardDrive className="w-4 h-4 text-muted-foreground shrink-0" />
                           ) : (
                             <Folder className="w-4 h-4 text-amber-500 shrink-0" />
                           )}
-                          <span className="text-sm text-slate-700 truncate">
+                          <span className="text-sm text-foreground truncate">
                             {isDisk ? (entry.label || entry.name.replace("\\", "")) : entry.name}
                           </span>
-                          {isDisk && <span className="text-xs text-slate-400 shrink-0">({entry.name.replace("\\", "")})</span>}
+                          {isDisk && <span className="text-xs text-muted-foreground shrink-0">({entry.name.replace("\\", "")})</span>}
                         </div>
                       );
                     })
                 )}
               </div>
-              <div className="flex items-center justify-between px-4 py-3 bg-slate-50 border-t border-slate-200">
-                <div className="text-xs text-slate-500 font-mono truncate flex-1 mr-4">
-                  当前路径：{dirPickerPath || "此电脑"}
+              <div className="flex items-center justify-between px-4 py-3 bg-card border-t border-border">
+                <div className="text-xs text-muted-foreground font-mono truncate flex-1 mr-4">
+                  当前选择：{dirPickerSelected || dirPickerPath || "此电脑"}
                 </div>
                 <div className="flex gap-2">
                   <button onClick={() => setDirPickerOpen(false)}
-                    className="px-4 py-2 text-sm text-slate-600 hover:bg-slate-200 rounded-md transition-colors">
+                    className="px-4 py-2 text-sm text-muted-foreground hover:bg-muted rounded-md transition-colors">
                     取消
                   </button>
                   <button
                     onClick={() => {
-                      setConfirmTargetInput(dirPickerPath);
+                      setConfirmTargetInput(dirPickerSelected || dirPickerPath);
                       setDirPickerOpen(false);
                     }}
-                    className="px-4 py-2 text-sm text-white bg-blue-500 hover:bg-blue-600 rounded-md transition-colors font-medium">
+                    className="px-4 py-2 text-sm text-white bg-primary hover:opacity-90 rounded-md transition-colors font-medium">
                     选择此文件夹
                   </button>
                 </div>
@@ -1405,11 +1499,11 @@ export const FileManager: React.FC<FileManagerProps> = ({ isOpen, onClose, onMin
           </div>
         )}
         {dragOver && (
-          <div className="absolute inset-0 z-40 bg-blue-500/20 border-4 border-blue-500 border-dashed flex items-center justify-center pointer-events-none rounded-lg">
-            <div className="bg-white/90 px-8 py-4 rounded-lg shadow-lg">
+          <div className="absolute inset-0 z-40 bg-primary/20 border-4 border-primary border-dashed flex items-center justify-center pointer-events-none rounded-lg">
+            <div className="bg-card/90 px-8 py-4 rounded-lg shadow-lg">
               <div className="flex items-center gap-3">
-                <Upload className="w-8 h-8 text-blue-500" />
-                <span className="text-blue-700 font-medium text-lg">释放以上传文件</span>
+                <Upload className="w-8 h-8 text-primary" />
+                <span className="text-primary font-medium text-lg">释放以上传文件</span>
               </div>
             </div>
           </div>
