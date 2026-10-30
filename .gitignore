@@ -27,6 +27,12 @@ hub_err.txt
 # Test scripts
 test_ws.*
 
+# Local build backups / archives
+_backup/
+
+# Hub runtime data (device ids, names, tags)
+server-go/data/
+
 # IDE / tooling
 .trae/
 .vscode/
