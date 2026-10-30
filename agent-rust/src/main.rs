@@ -87,6 +87,120 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PeekMessageW, PM_NOREMOVE,
 };
 
+/// 客户端是否要求隐藏被控端光标（隐藏会作用于整台电脑，本机用户也需要看见指针）
+#[cfg(windows)]
+static HOST_CURSOR_HIDE_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// 当前是否因本机（非注入）输入而临时恢复了光标
+#[cfg(windows)]
+static HOST_CURSOR_SHOWN_FOR_LOCAL: AtomicBool = AtomicBool::new(false);
+
+/// 隐藏/恢复被控电脑的桌面光标。
+///
+/// 不能用 ShowCursor：它的显示计数是线程私有的（实测两个线程各自都能降到 -1，
+/// 桌面 CURSOR_SHOWING 仍为 1），而 Agent 没有窗口，改不到桌面光标。
+/// 这里把每种系统光标替换成全透明光标，恢复时让系统重新加载用户光标方案。
+#[cfg(windows)]
+fn set_host_cursor_visible(visible: bool) {
+    use windows::Win32::Foundation::HINSTANCE;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateCursor, SetSystemCursor, SystemParametersInfoW,
+        OCR_APPSTARTING, OCR_CROSS, OCR_HAND, OCR_HELP, OCR_IBEAM, OCR_NO, OCR_NORMAL,
+        OCR_SIZEALL, OCR_SIZENESW, OCR_SIZENS, OCR_SIZENWSE, OCR_SIZEWE, OCR_UP, OCR_WAIT,
+        SPIF_SENDCHANGE, SPI_SETCURSORS,
+    };
+    unsafe {
+        if visible {
+            let _ = SystemParametersInfoW(SPI_SETCURSORS, 0, None, SPIF_SENDCHANGE);
+            return;
+        }
+        // 32x32：AND 掩码全 1（透明），XOR 掩码全 0
+        let and_mask = [0xFFu8; 32 * 32 / 8];
+        let xor_mask = [0x00u8; 32 * 32 / 8];
+        let cursor_ids = [
+            OCR_NORMAL, OCR_IBEAM, OCR_WAIT, OCR_CROSS, OCR_UP, OCR_SIZENWSE, OCR_SIZENESW,
+            OCR_SIZEWE, OCR_SIZENS, OCR_SIZEALL, OCR_NO, OCR_HAND, OCR_APPSTARTING, OCR_HELP,
+        ];
+        for id in cursor_ids {
+            // SetSystemCursor 会销毁传入的光标句柄，所以每次都要新建一个
+            if let Ok(blank) = CreateCursor(
+                HINSTANCE::default(),
+                0,
+                0,
+                32,
+                32,
+                and_mask.as_ptr() as *const _,
+                xor_mask.as_ptr() as *const _,
+            ) {
+                let _ = SetSystemCursor(blank, id);
+            }
+        }
+    }
+}
+
+/// 应用客户端的显隐要求（隐藏作用于整台电脑，因此要配合本机输入检测）
+#[cfg(windows)]
+fn apply_host_cursor(hidden: bool) {
+    HOST_CURSOR_HIDE_REQUESTED.store(hidden, Ordering::SeqCst);
+    HOST_CURSOR_SHOWN_FOR_LOCAL.store(false, Ordering::SeqCst);
+    set_host_cursor_visible(!hidden);
+}
+
+/// 低层鼠标钩子：本机（非注入）输入出现时恢复光标，远端注入输入恢复后重新隐藏。
+/// SendInput 注入的事件带 LLMHF_INJECTED 标志，因此能区分两端谁在用鼠标。
+#[cfg(windows)]
+unsafe extern "system" fn cursor_input_hook(
+    code: i32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, HHOOK, LLMHF_INJECTED, MSLLHOOKSTRUCT,
+    };
+    if code >= 0 && HOST_CURSOR_HIDE_REQUESTED.load(Ordering::SeqCst) {
+        let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+        if info.flags & LLMHF_INJECTED != 0 {
+            if HOST_CURSOR_SHOWN_FOR_LOCAL.swap(false, Ordering::SeqCst) {
+                set_host_cursor_visible(false);
+                log_info!("[Cursor] Remote input resumed, host cursor hidden");
+            }
+        } else if !HOST_CURSOR_SHOWN_FOR_LOCAL.swap(true, Ordering::SeqCst) {
+            set_host_cursor_visible(true);
+            log_info!("[Cursor] Local mouse input detected, host cursor restored");
+        }
+    }
+    CallNextHookEx(HHOOK::default(), code, wparam, lparam)
+}
+
+#[cfg(windows)]
+fn start_cursor_input_guard() {
+    std::thread::spawn(|| unsafe {
+        use windows::Win32::Foundation::HINSTANCE;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, GetMessageW, SetWindowsHookExW, TranslateMessage,
+            UnhookWindowsHookEx, MSG, WH_MOUSE_LL,
+        };
+        let hook = match SetWindowsHookExW(
+            WH_MOUSE_LL,
+            Some(cursor_input_hook),
+            HINSTANCE::default(),
+            0,
+        ) {
+            Ok(hook) => hook,
+            Err(e) => {
+                log_warn!("[Cursor] Failed to install local-input hook: {}", e);
+                return;
+            }
+        };
+        log_info!("[Cursor] Local-input hook installed");
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        let _ = UnhookWindowsHookEx(hook);
+    });
+}
+
 #[cfg(windows)]
 fn send_input_raw(inputs: &[INPUT]) {
     let result = unsafe {
@@ -234,8 +348,7 @@ fn send_key_down_up(vk: u16, down: bool) {
 }
 
 #[cfg(windows)]
-fn mouse_move_to(x: i32, y: i32) {
-    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+fn ensure_msg_queue() {
     static MSG_QUEUE_INIT: OnceLock<()> = OnceLock::new();
     MSG_QUEUE_INIT.get_or_init(|| {
         unsafe {
@@ -243,6 +356,12 @@ fn mouse_move_to(x: i32, y: i32) {
             let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
         }
     });
+}
+
+#[cfg(windows)]
+fn mouse_move_to(x: i32, y: i32) {
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+    ensure_msg_queue();
     let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
     let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
     let abs_x = (x as f32 / screen_w as f32 * 65535.0) as i32;
@@ -262,6 +381,32 @@ fn mouse_move_to(x: i32, y: i32) {
     };
     send_input_raw(&[input]);
 }
+
+/// 相对移动：给锁定光标/按增量旋转视角的程序（UE5 视口等）用，不受绝对坐标跳变影响。
+#[cfg(windows)]
+fn mouse_move_rel(dx: i32, dy: i32) {
+    if dx == 0 && dy == 0 {
+        return;
+    }
+    ensure_msg_queue();
+    let input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx,
+                dy,
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_MOVE,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    send_input_raw(&[input]);
+}
+
+#[cfg(not(windows))]
+fn mouse_move_rel(_dx: i32, _dy: i32) {}
 
 #[cfg(windows)]
 fn mouse_button(button: u8, down: bool) {
@@ -893,6 +1038,13 @@ fn handle_binary_msg(data: &[u8], ack_tx: &tokio::sync::mpsc::Sender<Message>) {
                     let _ = ack_tx.try_send(Message::Text(ack));
                 }
             }
+        }
+        0x08 => {
+            // 相对移动：[0x08, 0, dx_lo, dx_hi, dy_lo, dy_hi]（int16 LE）
+            if data.len() < 6 { return; }
+            let dx = i16::from_le_bytes([data[2], data[3]]) as i32;
+            let dy = i16::from_le_bytes([data[4], data[5]]) as i32;
+            mouse_move_rel(dx, dy);
         }
         0x07 => {
             // File transfer EOF
@@ -1546,6 +1698,10 @@ async fn main() {
     let mut priority_sender_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut control_handler_handle: Option<tokio::task::JoinHandle<()>> = None;
 
+    // 监听本机鼠标输入：被控端有人直接操作时把光标放出来（注入事件不算）
+    #[cfg(windows)]
+    start_cursor_input_guard();
+
     'reconnect: loop {
         // 启动插桩：确认已进入重连循环（若卡死在前面则此处不打印）
         log_info!("[Reconnect] Entering reconnect loop");
@@ -1561,6 +1717,9 @@ async fn main() {
             h.abort();
             log_info!("[Reconnect] Aborted old control handler task");
         }
+        // 连接已断（或进程刚启动）：恢复被控端光标，避免它一直处于隐藏态
+        #[cfg(windows)]
+        apply_host_cursor(false);
         
         // 屏幕尺寸：进程内只取一次（缓存），用 GetSystemMetrics 获取——**不创建 DXGI 设备**。
         // 旧实现每次重连都创建+销毁 DXGI Capturer：1) 驱动层残留线程，每次重连 +15 且不释放；
@@ -1797,6 +1956,12 @@ async fn main() {
                                 mouse_move_to(x, y);
                             }
                         }
+                        "mouse_move_rel" => {
+                            // x/y 作为 dx/dy 使用
+                            if let (Some(dx), Some(dy)) = (cmd.x, cmd.y) {
+                                mouse_move_rel(dx, dy);
+                            }
+                        }
                         "mouse_down" => {
                             match cmd.button.as_deref() {
                                 Some("left") => mouse_button(0, true),
@@ -1918,6 +2083,13 @@ async fn main() {
                                 QUALITY_PROFILE.store(value, Ordering::Relaxed);
                                 log_info!("Quality profile set to {}", value);
                             }
+                        }
+                        "cursor" => {
+                            // value: 1 = 显示，0 = 隐藏（被控电脑的桌面光标）
+                            let visible = cmd.value.unwrap_or(1) != 0;
+                            #[cfg(windows)]
+                            apply_host_cursor(!visible);
+                            log_info!("Host cursor {}", if visible { "shown" } else { "hidden" });
                         }
                         "file_init" => {
                             // 解析文件传输初始化参数
@@ -3643,6 +3815,8 @@ async fn main() {
             // 通知视频线程退出（进程即将结束，无需等待 join）
             video_shutdown.store(true, Ordering::Relaxed);
             log_info!("Agent shutting down...");
+            #[cfg(windows)]
+            apply_host_cursor(false);
             // 清理所有终端会话
             terminal::shutdown_all();
             *lock_state!(TERM_EVENT_TX) = None;
@@ -3675,6 +3849,8 @@ async fn main() {
             if let Some(h) = control_handler_handle.take() {
                 h.abort();
             }
+            #[cfg(windows)]
+            apply_host_cursor(false);
             let jitter = (std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
