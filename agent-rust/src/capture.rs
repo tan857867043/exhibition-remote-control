@@ -42,7 +42,7 @@ impl GDICapturer {
         }
     }
 
-    pub fn capture_frame(&mut self) -> Option<Vec<u8>> {
+    pub fn capture_frame(&mut self, buf: &mut Vec<u8>) -> bool {
         use windows::Win32::Graphics::Gdi::*;
         unsafe {
             let _ = BitBlt(self.mem_dc, 0, 0, self.width as i32, self.height as i32,
@@ -58,21 +58,22 @@ impl GDICapturer {
 
             let row_size = self.width * 4;
             let total_size = row_size * self.height;
-            let mut data = vec![0u8; total_size];
+            buf.clear();
+            buf.resize(total_size, 0);
 
             let result = GetDIBits(self.mem_dc, self.hbitmap, 0, self.height as u32,
-                Some(data.as_mut_ptr() as *mut _), &mut bmi, DIB_RGB_COLORS);
+                Some(buf.as_mut_ptr() as *mut _), &mut bmi, DIB_RGB_COLORS);
 
             if result == 0 {
-                return None;
+                return false;
             }
 
             // 转换 BGRA 中的 A 通道为 255（GetDIBits 可能返回 0 alpha）
-            for pixel in data.chunks_exact_mut(4) {
+            for pixel in buf.chunks_exact_mut(4) {
                 pixel[3] = 255;
             }
 
-            Some(data)
+            true
         }
     }
 }
@@ -129,12 +130,13 @@ impl ScreenCapturer {
         }
     }
 
-    pub fn capture_frame(&mut self) -> Result<Vec<u8>, CaptureError> {
+    pub fn capture_frame(&mut self, buf: &mut Vec<u8>) -> Result<(), CaptureError> {
         match self.capturer.frame() {
             Ok(frame) => {
-                let mut data = vec![0; frame.len()];
-                data.copy_from_slice(&frame);
-                Ok(data)
+                buf.clear();
+                buf.resize(frame.len(), 0);
+                buf.copy_from_slice(&frame);
+                Ok(())
             }
             Err(error) => {
                 if error.kind() == std::io::ErrorKind::WouldBlock {
