@@ -32,11 +32,12 @@ type KnownDevice struct {
 	Order   int      `json:"order"`
 	Tags    []string `json:"tags"`
 	AddedAt string   `json:"added_at"`
+	MAC     string   `json:"mac,omitempty"` // Agent 注册时带回，持久化供 WOL 远程开机使用
 }
 
 type DeviceStorage struct {
-	KnownDevices      []KnownDevice     `json:"known_devices"`
-	DiscoveredDevices map[string]bool   `json:"discovered_devices"` // device IDs that connected but not yet added
+	KnownDevices      []KnownDevice   `json:"known_devices"`
+	DiscoveredDevices map[string]bool `json:"discovered_devices"` // device IDs that connected but not yet added
 }
 
 type FrameMsg struct {
@@ -44,27 +45,118 @@ type FrameMsg struct {
 	Payload []byte
 }
 
+// AgentConn 包装 Rust Agent 的 WS 连接，确保"单 writer 协程"串行写入。
+// gorilla/websocket 的 *Conn.WriteMessage 不是并发安全的，并发写会导致帧交错崩溃。
+type AgentConn struct {
+	Conn       *websocket.Conn
+	controlQ   chan controlMsg // 高优先级：控制指令（外部 HTTP control API + pause/resume 心跳等）
+	payloadQ   chan FrameMsg   // 低优先级：给 Agent 发送的文件/数据（预留，目前主要是 controlQ）
+	ResponseCh chan []byte     // 系统配置响应通道（如 get_ip_config / rename_computer / set_ip 的返回结果）
+	closeQ     chan struct{}   // 关闭信号，writer goroutine 退出
+	deviceID   string          // 仅日志用
+}
+
+type controlMsg struct {
+	MsgType int
+	Payload []byte
+}
+
+// StartWriter 启动该 Agent 的"单 writer 协程"，串行 drain controlQ/payloadQ。
+// 任何要写到 Agent 连接的数据必须提交到 chan，不能直接 Conn.WriteMessage。
+func (a *AgentConn) StartWriter() {
+	go func() {
+		defer func() {
+			_ = recover()
+			_ = a.Conn.Close()
+		}()
+		for {
+			select {
+			case <-a.closeQ:
+				return
+			case msg, ok := <-a.controlQ:
+				if !ok {
+					return
+				}
+				// 单次写超时 2s（Agent TCP 窗口堵死时避免整个 writer 卡死）
+				_ = a.Conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+				if err := a.Conn.WriteMessage(msg.MsgType, msg.Payload); err != nil {
+					log.Printf("[AgentWriter] %s control write failed: %v, exiting writer", a.deviceID, err)
+					return
+				}
+			case msg, ok := <-a.payloadQ:
+				if !ok {
+					return
+				}
+				_ = a.Conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+				if err := a.Conn.WriteMessage(msg.MsgType, msg.Payload); err != nil {
+					log.Printf("[AgentWriter] %s payload write failed: %v, exiting writer", a.deviceID, err)
+					return
+				}
+			}
+		}
+	}()
+}
+
+// Close 关闭 writer 协程并关闭底层连接，幂等。
+func (a *AgentConn) Close() {
+	select {
+	case <-a.closeQ:
+		// 已关
+	default:
+		close(a.closeQ)
+	}
+	_ = a.Conn.Close()
+}
+
+// SendControl 提交一条控制指令给 writer，超时 1s。成功返回 true，失败（writer死/队列满）返回 false。
+func (a *AgentConn) SendControl(msgType int, payload []byte) bool {
+	select {
+	case a.controlQ <- controlMsg{MsgType: msgType, Payload: payload}:
+		return true
+	case <-time.After(time.Second):
+		log.Printf("[AgentWriter] %s control queue full (>%d) or writer dead, drop msg len=%d",
+			a.deviceID, cap(a.controlQ), len(payload))
+		return false
+	case <-a.closeQ:
+		return false
+	}
+}
+
 type DeviceHub struct {
-	mu                 sync.RWMutex
-	Agents             map[string]*websocket.Conn                        // 存放 Rust 被控端的 WS 连接
-	DeviceInfos        map[string]DeviceInfo                             // 存放设备信息
-	LatestFrame        map[string][]byte                                 // 存放最新一帧完整的画面作为缩略图
-	Subscribers        map[string]map[*websocket.Conn]bool               // 存放订阅特定设备画面流的第三方应用连接
-	SubscriberChannels map[string]map[*websocket.Conn]chan FrameMsg      // 订阅者缓冲通道，帧满时 drain 旧帧
-	DeviceStorage      *DeviceStorage                                    // 持久化设备存储
+	mu                  sync.RWMutex
+	Agents              map[string]*AgentConn                        // Rust 被控端 WS 连接（含单 writer 协程）
+	DeviceInfos         map[string]DeviceInfo                        // 存放设备信息
+	LatestFrame         map[string][]byte                            // 存放最新一帧完整的画面作为缩略图
+	LatestFrameTime     map[string]time.Time                         // 最近一帧接收时间，用于判断缩略图是否过期
+	LatestFrameSeq      map[string]uint64                            // 帧序号，用于识别"新帧"（快照触发后等待新帧）
+	LastSnapshotReq     map[string]time.Time                         // 最近一次快照触发时间，用于限流
+	Subscribers         map[string]map[*websocket.Conn]bool          // 存放订阅特定设备画面流的第三方应用连接
+	SubscriberChannels  map[string]map[*websocket.Conn]chan FrameMsg // 订阅者缓冲通道，帧满时 drain 旧帧
+	SubscriberKind      map[string]map[*websocket.Conn]string        // 订阅用途：control（画面/控制）或 files（仅文件传输）
+	TerminalSubscribers map[string]map[*websocket.Conn]chan []byte   // 终端(控制台)订阅者：device_id → 终端订阅者集合
+	DeviceStorage       *DeviceStorage                               // 持久化设备存储
 }
 
 var GlobalHub = &DeviceHub{
-	Agents:             make(map[string]*websocket.Conn),
-	DeviceInfos:        make(map[string]DeviceInfo),
-	LatestFrame:        make(map[string][]byte),
-	Subscribers:        make(map[string]map[*websocket.Conn]bool),
-	SubscriberChannels: make(map[string]map[*websocket.Conn]chan FrameMsg),
+	Agents:              make(map[string]*AgentConn),
+	DeviceInfos:         make(map[string]DeviceInfo),
+	LatestFrame:         make(map[string][]byte),
+	LatestFrameTime:     make(map[string]time.Time),
+	LatestFrameSeq:      make(map[string]uint64),
+	LastSnapshotReq:     make(map[string]time.Time),
+	Subscribers:         make(map[string]map[*websocket.Conn]bool),
+	SubscriberChannels:  make(map[string]map[*websocket.Conn]chan FrameMsg),
+	SubscriberKind:      make(map[string]map[*websocket.Conn]string),
+	TerminalSubscribers: make(map[string]map[*websocket.Conn]chan []byte),
 	// DeviceStorage is set in InitRouter
 }
 
 func dataDir() string {
-	dir := filepath.Join("data")
+	base := os.Getenv("LOCALAPPDATA")
+	if base == "" {
+		base = filepath.Join(os.Getenv("USERPROFILE"), "AppData", "Local")
+	}
+	dir := filepath.Join(base, "ExhibitionHub", "data")
 	os.MkdirAll(dir, 0755)
 	return dir
 }
@@ -92,6 +184,8 @@ func loadDeviceStorage() *DeviceStorage {
 	return ds
 }
 
+var storageWriteMu sync.Mutex
+
 func saveDeviceStorage() {
 	GlobalHub.mu.RLock()
 	knownDevices := make([]KnownDevice, len(GlobalHub.DeviceStorage.KnownDevices))
@@ -111,8 +205,55 @@ func saveDeviceStorage() {
 		log.Printf("[Hub] Error marshaling device storage: %v", err)
 		return
 	}
-	if err := os.WriteFile(storagePath(), data, 0644); err != nil {
+
+	// 串行化写入 + 临时文件 rename，避免并发写互相覆盖或断电留下半截 JSON
+	storageWriteMu.Lock()
+	defer storageWriteMu.Unlock()
+	path := storagePath()
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
 		log.Printf("[Hub] Error writing device storage: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		log.Printf("[Hub] Error replacing device storage: %v", err)
+	}
+}
+
+// restorePersistedDevices 启动时将持久化的设备元数据恢复到内存设备列表：
+// - 已添加(known)设备恢复为离线占位设备（保留自定义名称/排序/标签），
+//   否则 Hub 重启后离线未重连的已添加设备会从设备列表中消失；
+// - 已发现(discovered)设备恢复为离线待添加设备，等待 Agent 重新连接补充详情。
+func restorePersistedDevices() {
+	GlobalHub.mu.Lock()
+	defer GlobalHub.mu.Unlock()
+
+	for _, kd := range GlobalHub.DeviceStorage.KnownDevices {
+		if _, exists := GlobalHub.DeviceInfos[kd.ID]; exists {
+			continue
+		}
+		GlobalHub.DeviceInfos[kd.ID] = DeviceInfo{
+			ID:     kd.ID,
+			Name:   kd.Name,
+			Online: false,
+			Order:  kd.Order,
+			Tags:   kd.Tags,
+			Added:  true,
+			MAC:    kd.MAC, // 恢复持久化的 MAC，离线设备也保留远程开机(WOL)能力
+		}
+	}
+
+	for id := range GlobalHub.DeviceStorage.DiscoveredDevices {
+		if _, exists := GlobalHub.DeviceInfos[id]; exists {
+			continue
+		}
+		GlobalHub.DeviceInfos[id] = DeviceInfo{
+			ID:     id,
+			Name:   id,
+			Online: false,
+			Added:  false,
+		}
 	}
 }
 
@@ -159,19 +300,36 @@ func FindOrRegisterDevice(id string, info DeviceInfo) {
 			info.Name = known.Name
 			GlobalHub.DeviceInfos[id] = info
 		}
+		// 持久化 MAC（首次/补录）：Agent 在线时若 known 记录缺 MAC 或 MAC 变化，同步写入存储，
+		// 保证离线后仍有 MAC 可用于 WOL 远程开机
+		if info.MAC != "" && known.MAC != info.MAC {
+			known.MAC = info.MAC
+			go saveDeviceStorage()
+		}
 		return
 	}
 
-	// Device not known yet — mark as discovered if not already
-	if !GlobalHub.DeviceStorage.DiscoveredDevices[id] {
-		GlobalHub.DeviceStorage.DiscoveredDevices[id] = true
-		go saveDeviceStorage()
+	// Device not known yet — auto-add to known devices so it appears immediately in the device list.
+	// Agents connect to /agent/register intentionally (WebSocket), they should not be "discovered".
+	maxOrder := 0
+	for _, d := range GlobalHub.DeviceStorage.KnownDevices {
+		if d.Order > maxOrder {
+			maxOrder = d.Order
+		}
 	}
-
-	// Still put in DeviceInfos so we can query non-added devices
+	GlobalHub.DeviceStorage.KnownDevices = append(GlobalHub.DeviceStorage.KnownDevices, KnownDevice{
+		ID:      id,
+		Name:    info.Name,
+		Order:   maxOrder + 1,
+		Tags:    []string{},
+		AddedAt: time.Now().UTC().Format(time.RFC3339),
+		MAC:     info.MAC, // 首次注册即持久化 MAC，供离线时 WOL 远程开机
+	})
 	info.Online = true
-	info.Added = false
+	info.Added = true
+	info.Order = maxOrder + 1
 	GlobalHub.DeviceInfos[id] = info
+	go saveDeviceStorage()
 }
 
 // MarkDeviceOffline marks a device as offline
@@ -244,13 +402,9 @@ func RemoveDeviceFromKnown(id string) bool {
 		GlobalHub.DeviceStorage.KnownDevices[idx+1:]...,
 	)
 
-	// Update DeviceInfos
-	if info, exists := GlobalHub.DeviceInfos[id]; exists {
-		info.Added = false
-		info.Order = 0
-		info.Tags = []string{}
-		GlobalHub.DeviceInfos[id] = info
-	}
+	// 从内存设备列表中彻底移除，避免残留为“离线待添加”的幽灵发现设备；
+	// Agent 重新连接时 FindOrRegisterDevice 会将其重新发现
+	delete(GlobalHub.DeviceInfos, id)
 
 	go saveDeviceStorage()
 	return true
@@ -392,4 +546,58 @@ func GetKnownDeviceList() []DeviceInfo {
 		}
 	}
 	return result
+}
+
+// ── 终端(控制台)订阅者管理 ──
+
+// RegisterTerminalSubscriber 注册某设备的终端订阅者（前端远程控制台连接）
+func RegisterTerminalSubscriber(deviceID string, conn *websocket.Conn, ch chan []byte) {
+	GlobalHub.mu.Lock()
+	defer GlobalHub.mu.Unlock()
+
+	if GlobalHub.TerminalSubscribers[deviceID] == nil {
+		GlobalHub.TerminalSubscribers[deviceID] = make(map[*websocket.Conn]chan []byte)
+	}
+	GlobalHub.TerminalSubscribers[deviceID][conn] = ch
+}
+
+// UnregisterTerminalSubscriber 移除某设备的终端订阅者，订阅者为空时删除 map 键
+func UnregisterTerminalSubscriber(deviceID string, conn *websocket.Conn) {
+	GlobalHub.mu.Lock()
+	defer GlobalHub.mu.Unlock()
+
+	subs := GlobalHub.TerminalSubscribers[deviceID]
+	if subs == nil {
+		return
+	}
+	delete(subs, conn)
+	if len(subs) == 0 {
+		delete(GlobalHub.TerminalSubscribers, deviceID)
+	}
+}
+
+// BroadcastTerminal 将 Agent 回传的终端消息广播给该设备的所有终端订阅者。
+// 非阻塞写入各自 channel，通道满时 drain 旧消息推送最新，仍失败则丢弃并记录日志。
+func BroadcastTerminal(deviceID string, data []byte) {
+	GlobalHub.mu.RLock()
+	defer GlobalHub.mu.RUnlock()
+
+	subs := GlobalHub.TerminalSubscribers[deviceID]
+	for _, ch := range subs {
+		select {
+		case ch <- data:
+			// 正常发送
+		default:
+			// 通道满：drain 掉最旧的终端消息，然后推送最新的
+			select {
+			case <-ch:
+			default:
+			}
+			select {
+			case ch <- data:
+			default:
+				log.Printf("[Terminal] broadcast to device %s dropped terminal message (channel full)", deviceID)
+			}
+		}
+	}
 }

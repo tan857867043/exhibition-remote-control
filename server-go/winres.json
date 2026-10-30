@@ -1,0 +1,41 @@
+{
+  "RT_GROUP_ICON": {
+    "APP": {
+      "0000": [
+        "assets/favicon16.png",
+        "assets/favicon32.png",
+        "assets/favicon48.png"
+      ]
+    }
+  },
+  "RT_VERSION": {
+    "APP": {
+      "0000": {
+        "Fixed": {
+          "FileVersion": {
+            "Major": 1,
+            "Minor": 0,
+            "Patch": 0,
+            "Build": 0
+          },
+          "ProductVersion": {
+            "Major": 1,
+            "Minor": 0,
+            "Patch": 0,
+            "Build": 0
+          }
+        },
+        "StringFileInfo": {
+          "CompanyName": "Exhibition",
+          "FileDescription": "展厅远程控制 Hub",
+          "FileVersion": "1.0.0",
+          "InternalName": "exhibition-hub",
+          "LegalCopyright": "Exhibition Remote Control",
+          "OriginalFilename": "exhibition-hub.exe",
+          "ProductName": "展厅远程控制",
+          "ProductVersion": "1.0.0"
+        }
+      }
+    }
+  }
+}
